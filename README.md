@@ -1,8 +1,33 @@
-# Hunyuan3D-2 + 3D Print Pipeline
+# 3DPrint-Full-Pipeline — Blackwell Edition
 
 Генерация 3D-моделей из изображений с последующей подготовкой к 3D-печати.
+Форк [Tencent-Hunyuan/Hunyuan3D-2](https://github.com/Tencent-Hunyuan/Hunyuan3D-2), проверен на видеокартах **RTX 50-series (Blackwell / sm_120)**.
 
-Оригинальный репозиторий: [Tencent-Hunyuan/Hunyuan3D-2](https://github.com/Tencent-Hunyuan/Hunyuan3D-2)
+[![Python](https://img.shields.io/badge/Python-3.12-blue?logo=python)](https://www.python.org/)
+[![CUDA](https://img.shields.io/badge/CUDA-13.0-green?logo=nvidia)](https://developer.nvidia.com/cuda-toolkit)
+[![PyTorch](https://img.shields.io/badge/PyTorch-2.11%2Bcu130-orange?logo=pytorch)](https://pytorch.org/)
+[![GPU](https://img.shields.io/badge/GPU-RTX%2050%20series%20%28sm__120%29-76b900?logo=nvidia)](https://www.nvidia.com/)
+[![diffusers](https://img.shields.io/badge/diffusers-0.38.0-yellow)](https://github.com/huggingface/diffusers)
+[![VRAM](https://img.shields.io/badge/VRAM-16%20GB-informational)]()
+
+---
+
+## Протестированное окружение
+
+| Компонент | Версия / значение |
+|---|---|
+| GPU | NVIDIA RTX 5060 Ti (Blackwell, **sm_120**) |
+| VRAM | 16 GB |
+| CUDA | **13.0** (torch build: `cu130`) |
+| Python | **3.12** |
+| PyTorch | **2.11.0+cu130** |
+| diffusers | 0.38.0 |
+| transformers | 5.8.0 |
+| ОС | Ubuntu 24.04 (WSL2) |
+
+> **Почему Blackwell отдельно?** Архитектура sm_120 появилась в RTX 50‑й серии.
+> Upstream Hunyuan3D-2 не запускается «из коробки»: оригинальные инструкции предполагают CUDA ≤12 и Python 3.10.
+> Этот форк содержит исправления и инструкцию по сборке CUDA‑расширений для CUDA 13 / sm_120.
 
 ## Что такое Hunyuan3D-2
 
@@ -11,7 +36,8 @@ AI-модель от Tencent для генерации 3D-мешей с текс
 1. **Shape generation** (Hunyuan3D-DiT) — создаёт геометрию меша из картинки
 2. **Texture synthesis** (Hunyuan3D-Paint) — генерирует текстуру для меша
 
-Требования: NVIDIA GPU с CUDA (6 GB VRAM только форма, 16 GB VRAM форма + текстура), Python 3.10+.
+Требования: NVIDIA GPU с CUDA. VRAM: 6 GB (только форма), 16 GB (форма + текстура).
+Этот форк протестирован на **Python 3.12 + CUDA 13.0 + PyTorch 2.11+cu130** (RTX 50-series).
 
 ## Что добавлено по сравнению с оригиналом
 
@@ -51,12 +77,85 @@ AI-модель от Tencent для генерации 3D-мешей с текс
 
 ## Установка
 
+### 1. Зависимости
+
 ```bash
-# Зависимости
 pip install -r requirements.txt
 pip install -e .
+```
 
-# C++/CUDA расширения для текстурирования
+### 2. CUDA-расширения для текстурирования
+
+> **RTX 50-series (Blackwell / sm_120):** стандартная инструкция не работает — системный `nvcc` (CUDA 12) не поддерживает sm_120 и конфликтует с PyTorch cu130.
+> Следуйте инструкции ниже.
+
+#### Подготовка CUDA 13 toolchain (один раз, без sudo)
+
+```bash
+# Скачать nvcc 13 + заголовки CUDA 13 в ~/cuda13
+BASE=https://developer.download.nvidia.com/compute/cuda/redist
+mkdir -p ~/cuda13/dl && cd ~/cuda13/dl
+
+# Скачать нужные компоненты
+for PKG in cuda_nvcc cuda_cudart cuda_crt libnvvm cuda_cccl; do
+    REL=$(python3 -c "import json,urllib.request; \
+        d=json.loads(urllib.request.urlopen('$BASE/redistrib_13.0.2.json').read()); \
+        print(d['$PKG']['linux-x86_64']['relative_path'])")
+    curl -fSL -o ${PKG}.tar.xz "$BASE/$REL"
+    tar xf ${PKG}.tar.xz
+done
+
+# Объединить в ~/cuda13
+for DIR in cuda_nvcc-* cuda_cudart-* cuda_crt-* libnvvm-* cuda_cccl-*; do
+    cp -a $DIR/. ~/cuda13/
+done
+cd ~/cuda13
+[ -d lib64 ] || ln -s lib lib64
+
+# Шимы хост-компилятора (gcc-12 обязателен — gcc-13 не поддерживается CUDA 13)
+mkdir -p ~/cuda13/hostbin
+ln -sf /usr/bin/gcc-12  ~/cuda13/hostbin/gcc
+ln -sf /usr/bin/g++-12  ~/cuda13/hostbin/g++
+```
+
+Убедиться, что всё готово:
+```bash
+~/cuda13/bin/nvcc --version  # должно показать "release 13.0"
+gcc-12 --version             # должно показать "gcc (Ubuntu 12.x...)"
+```
+
+#### Сборка custom_rasterizer
+
+```bash
+cd hy3dgen/texgen/custom_rasterizer
+
+export CUDA_HOME=~/cuda13
+export PATH=$CUDA_HOME/bin:$HOME/cuda13/hostbin:$PATH
+export CC=gcc-12 CXX=g++-12
+export TORCH_CUDA_ARCH_LIST="12.0"   # sm_120 = RTX 5060 Ti / 5070 / 5080 / 5090
+
+rm -rf build custom_rasterizer.egg-info dist
+pip install . --user --break-system-packages --no-build-isolation
+cd ../../..
+```
+
+#### Сборка differentiable_renderer (опционально, есть Python-fallback)
+
+```bash
+cd hy3dgen/texgen/differentiable_renderer
+export CUDA_HOME=~/cuda13
+export PATH=$CUDA_HOME/bin:$HOME/cuda13/hostbin:$PATH
+export CC=gcc-12 CXX=g++-12
+pip install . --user --break-system-packages --no-build-isolation
+cd ../../..
+```
+
+> После сборки `CUDA_HOME`/`PATH` **не нужны** для запуска — тулчейн нужен только при компиляции.
+
+#### Для не-Blackwell GPU (RTX 40-series и старше, CUDA ≤12)
+
+```bash
+# Оригинальные инструкции upstream:
 cd hy3dgen/texgen/custom_rasterizer && python setup.py install && cd ../../..
 cd hy3dgen/texgen/differentiable_renderer && python setup.py install && cd ../../..
 ```
