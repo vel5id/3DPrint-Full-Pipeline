@@ -525,14 +525,17 @@ def build_app():
                     with gr.Accordion('Generated Mesh', open=True):
                         html_gen_mesh = gr.HTML(HTML_OUTPUT_PLACEHOLDER, label='Output')
                     with gr.Accordion('Part Decomposition', open=False):
-                        gr.Markdown("Segment the generated mesh into semantic parts using P3-SAM, then generate completed parts with XPart.")
+                        gr.Markdown("Segment the generated mesh into semantic parts using P3-SAM, then generate completed parts with XPart, and prepare STL files for 3D printing.")
                         with gr.Row():
                             segment_btn = gr.Button(value="1. Segment Parts", variant="primary", min_width=100)
                             generate_parts_btn = gr.Button(value="2. Generate Parts", variant="primary", min_width=100)
+                            prepare_print_btn = gr.Button(value="3. Prepare for Printing", variant="primary", min_width=100)
                         part_status = gr.Markdown(value="Load a mesh first, then click **Segment**.")
                         with gr.Row():
                             part_segmented = gr.Model3D(clear_color=[0.0, 0.0, 0.0, 0.0], label="Segmented Mesh")
                             part_generated = gr.Model3D(clear_color=[0.0, 0.0, 0.0, 0.0], label="Generated Parts")
+                        with gr.Row():
+                            print_download = gr.File(label="Download STL Files (ZIP)", visible=True, interactive=False)
                         part_face_id = gr.File(label="Face IDs (.npy)", visible=False)
                         # Hidden state to carry mesh path from shape gen to part pipeline
                         part_mesh_state = gr.State(value=None)
@@ -846,7 +849,7 @@ def build_app():
             n_parts = len(aabb) if aabb is not None else 0
 
             # ---- Phase 1: GPU Cleanup ----
-            yield None, None, (
+            yield None, None, part_state, (
                 f"**🧹 Phase 1/4: Freeing GPU memory**\n\n"
                 f"Moving models to CPU...\n"
                 f"Parts to generate: **{n_parts}**"
@@ -862,7 +865,7 @@ def build_app():
 
             free_mb = torch.cuda.mem_get_info()[0] / 1e6 if torch.cuda.is_available() else -1
             est_min = max(1, n_parts * 0.5)
-            yield None, None, (
+            yield None, None, part_state, (
                 f"**🧹 Phase 1/4: GPU Cleanup — done**\n\n"
                 f"**Free VRAM:** {free_mb:.0f} / {gpu_total:.0f} MB\n"
                 f"**Parts:** {n_parts}\n\n"
@@ -872,7 +875,7 @@ def build_app():
 
             # ---- Phase 2: Load XPart + Run ----
             t0 = time.time()
-            yield None, None, (
+            yield None, None, part_state, (
                 f"**🚀 Phase 2/4: XPart Generation (GPU)...**\n\n"
                 f"**Parts:** {n_parts}\n"
                 f"**Estimated time:** {est_min:.0f}-{est_min*1.5:.0f} min\n"
@@ -891,7 +894,7 @@ def build_app():
 
             elapsed = time.time() - t0
             free_mb = torch.cuda.mem_get_info()[0] / 1e6 if torch.cuda.is_available() else -1
-            yield None, None, (
+            yield None, None, part_state, (
                 f"**✅ Phase 2/4: Generation Complete**\n\n"
                 f"**Time:** {elapsed:.0f}s (~{elapsed/60:.1f} min)\n"
                 f"**Free VRAM:** {free_mb:.0f} / {gpu_total:.0f} MB\n\n"
@@ -917,11 +920,16 @@ def build_app():
             obj_mesh.export(parts_path)
             explode_mesh.export(explode_path)
 
+            # Store parts path in state for downstream slicer
+            part_state['parts_path'] = parts_path
+            part_state['explode_path'] = explode_path
+
             free_mb = torch.cuda.mem_get_info()[0] / 1e6 if torch.cuda.is_available() else -1
-            yield parts_path, explode_path, (
+            yield parts_path, explode_path, part_state, (
                 f"**✅ Done!** Parts generated in {elapsed:.0f}s.\n\n"
                 f"**Free VRAM:** {free_mb:.0f} / {gpu_total:.0f} MB\n\n"
-                f"The exploded view shows all parts separated."
+                f"The exploded view shows all parts separated.\n\n"
+                f"Click **'3. Prepare for Printing'** to generate STL files."
             )
 
         segment_btn.click(
@@ -932,7 +940,120 @@ def build_app():
         generate_parts_btn.click(
             on_generate_parts,
             inputs=[part_mesh_state, seed],
-            outputs=[part_generated, part_segmented, part_status],
+            outputs=[part_generated, part_segmented, part_mesh_state, part_status],
+        )
+
+        def on_prepare_print(part_state, seed):
+            """Run slicer on generated parts — with live progress."""
+            import gc, time, zipfile, logging
+            _mem_logger = logging.getLogger("gradio.memory")
+
+            if part_state is None or not isinstance(part_state, dict) or 'parts_path' not in part_state:
+                raise gr.Error("Please run 'Segment Parts' and 'Generate Parts' first.")
+            parts_path = part_state['parts_path']
+            if not os.path.exists(parts_path):
+                raise gr.Error("Parts mesh no longer available. Please run 'Generate Parts' again.")
+
+            gpu_total = torch.cuda.get_device_properties(0).total_memory / 1e6 if torch.cuda.is_available() else 0
+
+            # ---- Phase 1: Load parts ----
+            yield None, None, (
+                f"**📂 Phase 1/4: Loading parts mesh...**\n\n"
+                f"Loading: `{os.path.basename(parts_path)}`"
+            )
+
+            parts_mesh = trimesh.load(parts_path, force='mesh')
+
+            # Handle both Trimesh and Scene
+            if isinstance(parts_mesh, trimesh.Trimesh):
+                scene = trimesh.Scene()
+                scene.add_geometry(parts_mesh, geom_name='generated_parts')
+            elif isinstance(parts_mesh, trimesh.Scene):
+                scene = parts_mesh
+            else:
+                raise gr.Error(f"Unexpected mesh type: {type(parts_mesh)}")
+
+            n_geoms = len(scene.geometry)
+            yield None, None, (
+                f"**📂 Phase 1/4: Parts loaded**\n\n"
+                f"**Geometries:** {n_geoms}\n\n"
+                f"**🔧 Phase 2/4: Running slicer...**\n"
+                f"• Checking bed fit\n"
+                f"• Generating pin/hole connectors\n"
+                f"• Exporting STL files\n"
+                f"⏳ Please wait..."
+            )
+
+            # ---- Phase 2: Run slicer ----
+            t0 = time.time()
+            try:
+                from hy3dgen.slicer import SlicerManager
+                from hy3dgen.slicer.config import load_profile
+
+                slicer = SlicerManager()
+                save_folder = gen_save_folder()
+                stl_dir = os.path.join(save_folder, 'stl')
+                os.makedirs(stl_dir, exist_ok=True)
+
+                result = slicer.process(
+                    scene,
+                    output_dir=stl_dir,
+                    skip_connectors=False,
+                )
+            except Exception as sl_exc:
+                gc.collect()
+                raise gr.Error(f"Slicer failed: {sl_exc}")
+
+            elapsed = time.time() - t0
+            n_parts = len(result)
+            fitted = sum(1 for p in result if p.fits_bed)
+            oversized = n_parts - fitted
+
+            yield None, None, (
+                f"**✅ Phase 2/4: Slicing complete**\n\n"
+                f"**Parts:** {n_parts}  |  "
+                f"**Fit bed:** {fitted}/{n_parts}  |  "
+                f"**Time:** {elapsed:.0f}s\n"
+                f"{'⚠ ' + str(oversized) + ' part(s) exceed bed size' if oversized else '✅ All parts fit the bed'}\n\n"
+                f"**📦 Phase 3/4: Creating ZIP archive...**"
+            )
+
+            # ---- Phase 3: Create ZIP ----
+            zip_path = os.path.join(save_folder, 'print_parts.zip')
+            stl_count = 0
+            with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zf:
+                for fname in sorted(os.listdir(stl_dir)):
+                    if fname.endswith('.stl') or fname.endswith('.txt'):
+                        zf.write(os.path.join(stl_dir, fname), fname)
+                        if fname.endswith('.stl'):
+                            stl_count += 1
+
+            zip_size_mb = os.path.getsize(zip_path) / (1024 * 1024)
+
+            yield zip_path, gr.update(), (
+                f"**📦 Phase 3/4: Archive ready**\n\n"
+                f"**STL files:** {stl_count}  |  "
+                f"**ZIP size:** {zip_size_mb:.1f} MB\n\n"
+                f"**💾 Phase 4/4: Done!**"
+            )
+
+            # ---- Phase 4: Done ----
+            del parts_mesh, scene
+            gc.collect()
+
+            yield gr.update(value=zip_path), gr.update(), (
+                f"**✅ Done!** Print parts ready.\n\n"
+                f"**STL files:** {stl_count}  |  "
+                f"**Fit bed:** {fitted}/{n_parts}  |  "
+                f"**Time:** {elapsed:.0f}s\n\n"
+                f"⬇️ **Download the ZIP file** below and extract to get individual STL files.\n"
+                f"📋 A README.txt with assembly notes is included in the archive."
+            )
+
+        prepare_print_btn.click(
+            on_prepare_print,
+            inputs=[part_mesh_state, seed],
+            outputs=[print_download, part_generated, part_status],
         )
 
         def on_export_click(file_out, file_out2, file_type, reduce_face, export_texture, target_face_num):
