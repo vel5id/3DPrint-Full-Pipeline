@@ -295,7 +295,14 @@ class ModelManager:
             ) from exc
 
     def unload_shape_model(self):
-        """Delete the shape pipeline and free GPU memory."""
+        """Delete the shape pipeline and free GPU + CPU memory.
+
+        Fully frees the pipeline (not just ``.to('cpu')``).  This is required
+        before running the part-decomposition pipeline (P3-SAM / XPart): keeping
+        the shape model resident — even moved to CPU — was found to corrupt the
+        CUDA context and make XPart's custom CUDA kernels (``torch_cluster.fps``)
+        fail asynchronously with ``CUDA error: unknown error``.
+        """
         if self._shape_pipeline is not None:
             logger.info("Unloading shape model ...")
             del self._shape_pipeline
@@ -303,6 +310,19 @@ class ModelManager:
             gc.collect()
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
+                torch.cuda.synchronize()
+
+    def ensure_shape_loaded(self):
+        """Reload the current shape model if it has been unloaded.
+
+        The part-decomposition flow fully unloads the shape model to free GPU/CPU
+        memory and keep the CUDA context clean.  Call this before any shape
+        generation so the model is transparently restored on demand.
+        """
+        if self._shape_pipeline is None:
+            logger.info("Shape model was unloaded — reloading %s/%s ...",
+                        self._shape_family, self._shape_variant)
+            self.load_shape_model(self._shape_family, self._shape_variant)
 
     # ------------------------------------------------------------------
     # Texture pipeline

@@ -171,6 +171,10 @@ def _gen_shape(
         if mv_image_right:
             image['right'] = mv_image_right
 
+    # Shape model may have been fully unloaded by the part-decomposition flow
+    # (to keep the CUDA context clean for XPart). Reload it on demand.
+    model_mgr.ensure_shape_loaded()
+
     seed = int(randomize_seed_fn(seed, randomize_seed))
 
     octree_resolution = int(octree_resolution)
@@ -724,15 +728,20 @@ def build_app():
                 f"Moving shape model to CPU..."
             )
 
-            if model_mgr.shape_pipeline is not None:
-                model_mgr.shape_pipeline.to('cpu')
-            if hasattr(model_mgr, 'tex_pipeline') and model_mgr.tex_pipeline is not None:
-                try: model_mgr.tex_pipeline.to('cpu')
+            # Fully unload shape + texture models (not just .to('cpu')).
+            # Keeping the shape model resident corrupts the CUDA context and makes
+            # XPart's custom kernels fail with 'CUDA error: unknown error'. Full
+            # unload also frees CPU RAM. Shape reloads on demand via ensure_shape_loaded().
+            model_mgr.unload_shape_model()
+            if hasattr(model_mgr, 'unload_tex_model'):
+                try: model_mgr.unload_tex_model()
                 except Exception: pass
 
             for _ in range(3):
                 gc.collect()
                 torch.cuda.empty_cache()
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
 
             free_mb = torch.cuda.mem_get_info()[0] / 1e6 if torch.cuda.is_available() else -1
             yield None, None, None, (
@@ -786,11 +795,10 @@ def build_app():
             except Exception as unload_exc:
                 _mem_logger.warning("Failed to unload P3-SAM: %s", unload_exc)
 
-            # Restore shape pipeline only if enough VRAM
-            if model_mgr.shape_pipeline is not None:
-                free_mb = torch.cuda.mem_get_info()[0] / 1e6 if torch.cuda.is_available() else 99999
-                if free_mb > 4000:
-                    model_mgr.shape_pipeline.to('cuda')
+            # NOTE: do NOT restore the shape model to GPU here. The user's next
+            # step is 'Generate Parts' (XPart); a resident shape model corrupts
+            # the CUDA context. The shape model reloads lazily on the next shape
+            # generation via model_mgr.ensure_shape_loaded().
             gc.collect(); torch.cuda.empty_cache()
 
             # Color mesh by part ID
@@ -855,13 +863,19 @@ def build_app():
                 f"Parts to generate: **{n_parts}**"
             )
 
-            if model_mgr.shape_pipeline is not None:
-                model_mgr.shape_pipeline.to('cpu')
+            # Fully unload shape + texture models before XPart (a resident shape
+            # model corrupts the CUDA context -> XPart fps 'CUDA error: unknown error').
+            model_mgr.unload_shape_model()
+            if hasattr(model_mgr, 'unload_tex_model'):
+                try: model_mgr.unload_tex_model()
+                except Exception: pass
             try: _partseg_mgr.unload_automask()
             except Exception: pass
 
             gc.collect(); torch.cuda.empty_cache()
             gc.collect(); torch.cuda.empty_cache()
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
 
             free_mb = torch.cuda.mem_get_info()[0] / 1e6 if torch.cuda.is_available() else -1
             est_min = max(1, n_parts * 0.5)
@@ -907,10 +921,8 @@ def build_app():
             except Exception as unload_exc:
                 _mem_logger.warning("Failed to unload XPart: %s", unload_exc)
 
-            if model_mgr.shape_pipeline is not None:
-                free_mb = torch.cuda.mem_get_info()[0] / 1e6 if torch.cuda.is_available() else 99999
-                if free_mb > 4000:
-                    model_mgr.shape_pipeline.to('cuda')
+            # Shape model stays unloaded; it reloads lazily on the next shape
+            # generation (model_mgr.ensure_shape_loaded()).
             gc.collect(); torch.cuda.empty_cache()
 
             # ---- Phase 4: Save ----

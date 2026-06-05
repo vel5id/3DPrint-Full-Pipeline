@@ -53,6 +53,11 @@ class PartSegManager:
     def _ensure_loaded(self, which="auto_mask"):
         """Import and initialise sub-models on first access.
 
+        Automatically detects available VRAM and selects dtype:
+        - ≤14 GB → bfloat16 weights + CPU offload (fit in 16 GB cards)
+        - 14-20 GB → bfloat16 weights (fit without offload)
+        - >20 GB → float32 (full quality)
+
         Parameters
         ----------
         which : str
@@ -64,6 +69,12 @@ class PartSegManager:
 
         if self._device is None:
             self._device = "cuda" if torch.cuda.is_available() else "cpu"
+
+        # Detect VRAM and pick dtype + offload strategy
+        if torch.cuda.is_available():
+            total_vram_gb = torch.cuda.get_device_properties(0).total_memory / (1024**3)
+        else:
+            total_vram_gb = 0
 
         if which in ("auto_mask", "all") and self._automask is None:
             gc.collect()
@@ -114,11 +125,42 @@ class PartSegManager:
                 "ckpt or ckpt_path must be specified in infer.yaml"
             )
 
+            # --- Auto-select dtype and offload strategy based on VRAM ---
+            # NOTE: We use float16 for model+vae, float32 for conditioner
+            # (spconv inside Sonata doesn't support fp16/bf16).
+            # Staged offload is only used when VRAM < 14 GB.
+            if total_vram_gb > 0 and total_vram_gb <= 14:
+                # ≤14 GB: fp16 + staged CPU offload
+                _dtype = torch.float16
+                _use_offload = True
+                strategy = "float16 + staged offload"
+            else:
+                # ≥14 GB: fp16 model+vae, fp32 conditioner, all on GPU
+                _dtype = torch.float16
+                _use_offload = False
+                strategy = "float16 (GPU-only)"
+
+            logger.info(
+                "XPart strategy: %s (VRAM: %.1f GB, offload: %s)",
+                strategy, total_vram_gb, _use_offload,
+            )
+
             self._pipeline = PartFormerPipeline.from_pretrained(
                 model_path="tencent/Hunyuan3D-Part",
                 verbose=True,
+                dtype=_dtype,
             )
-            self._pipeline.to(device=self._device, dtype=torch.float32)
+
+            if _use_offload:
+                # Enable CPU offload first (moves models via accelerate hooks,
+                # keeping at most one sub-model on GPU at a time).
+                # Do NOT call .to("cuda") — it would OOM on 16 GB cards.
+                self._pipeline.to(dtype=_dtype)  # dtype only, stay on CPU
+                logger.info("Enabling XPart CPU offload...")
+                self._pipeline.enable_model_cpu_offload(gpu_id=0)
+            else:
+                self._pipeline.to(device=self._device, dtype=_dtype)
+
             logger.info("XPart PartFormerPipeline loaded")
 
             if torch.cuda.is_available():
@@ -172,6 +214,8 @@ class PartSegManager:
         import torch
 
         logger.info("Moving XPart pipeline to CPU and freeing GPU memory...")
+        # Release accelerate CPU-offload hooks first if active
+        self._pipeline.maybe_free_model_hooks()
         self._pipeline.to(device="cpu")
         gc.collect()
         if torch.cuda.is_available():
@@ -227,8 +271,16 @@ class PartSegManager:
         face_ids : np.ndarray
             Per-face part labels.  -1 = unassigned.
         """
-        self._ensure_loaded(which="auto_mask")
         import torch
+        # Flush pending CUDA work from a previous stage (e.g. shape generation)
+        # before P3-SAM runs, to keep the CUDA context clean.
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+        self._ensure_loaded(which="auto_mask")
         import numpy as np
 
         logger.info("[MEM] Starting P3-SAM segmentation (prompt_bs=%d)...", prompt_bs)
@@ -273,8 +325,17 @@ class PartSegManager:
         exploded_mesh : trimesh.Trimesh
             Exploded view of the parts.
         """
-        self._ensure_loaded(which="pipeline")
         import torch
+        # Flush any pending CUDA work from a previous stage (shape gen / P3-SAM)
+        # before XPart's custom CUDA kernels (torch_cluster.fps) run. Skipping
+        # this lets an async 'CUDA error: unknown error' surface mid-generation.
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+        self._ensure_loaded(which="pipeline")
         import pytorch_lightning as pl
 
         pl.seed_everything(int(seed), workers=True)
