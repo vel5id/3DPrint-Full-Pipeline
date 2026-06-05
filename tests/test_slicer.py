@@ -7,6 +7,7 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
+import numpy as np
 import pytest
 import trimesh
 
@@ -218,3 +219,162 @@ class TestMeshCutter:
         results = cutter.process(scene)
         assert len(results) == 1
         assert results[0].name == "valid"
+
+
+# -----------------------------------------------------------------------
+# PinHoleGenerator tests
+# -----------------------------------------------------------------------
+
+from hy3dgen.slicer.connectors import PinHoleGenerator
+
+
+class TestPinHoleGenerator:
+    @pytest.fixture
+    def gen(self):
+        return PinHoleGenerator(QIDI_Q2_PROFILE.connector)
+
+    @pytest.fixture
+    def box_a(self):
+        """10x10x10 box at origin."""
+        return trimesh.creation.box(extents=[10, 10, 10])
+
+    @pytest.fixture
+    def box_b(self):
+        """10x10x10 box offset by 5 mm in X (close but not touching)."""
+        m = trimesh.creation.box(extents=[10, 10, 10])
+        m.apply_translation([15, 0, 0])  # 5 mm gap
+        return m
+
+    @pytest.fixture
+    def far_box(self):
+        """Box far away -- should NOT be detected as adjacent."""
+        m = trimesh.creation.box(extents=[10, 10, 10])
+        m.apply_translation([100, 0, 0])
+        return m
+
+    # -- adjacency detection --
+
+    def test_bbox_min_distance_touching(self):
+        """Two boxes touching should have 0 distance."""
+        min_a = np.array([0, 0, 0])
+        max_a = np.array([10, 10, 10])
+        min_b = np.array([10, 0, 0])
+        max_b = np.array([20, 10, 10])
+        d = PinHoleGenerator._bbox_min_distance(min_a, max_a, min_b, max_b)
+        assert d == 0.0
+
+    def test_bbox_min_distance_separated(self):
+        min_a = np.array([0, 0, 0])
+        max_a = np.array([10, 10, 10])
+        min_b = np.array([15, 0, 0])
+        max_b = np.array([25, 10, 10])
+        d = PinHoleGenerator._bbox_min_distance(min_a, max_a, min_b, max_b)
+        assert d == 5.0
+
+    def test_bbox_min_distance_overlapping(self):
+        min_a = np.array([0, 0, 0])
+        max_a = np.array([10, 10, 10])
+        min_b = np.array([5, 0, 0])
+        max_b = np.array([15, 10, 10])
+        d = PinHoleGenerator._bbox_min_distance(min_a, max_a, min_b, max_b)
+        assert d == 0.0
+
+    def test_find_adjacent_pairs_nearby(self, gen, box_a, box_b):
+        infos = [
+            PartInfo(box_a, "A", box_a.bounds[0], box_a.bounds[1],
+                     box_a.bounds[1] - box_a.bounds[0]),
+            PartInfo(box_b, "B", box_b.bounds[0], box_b.bounds[1],
+                     box_b.bounds[1] - box_b.bounds[0]),
+        ]
+        pairs = gen.find_adjacent_pairs(infos)
+        assert len(pairs) == 1
+        assert pairs[0][0] == 0
+        assert pairs[0][1] == 1
+
+    def test_find_adjacent_pairs_far(self, gen, box_a, far_box):
+        infos = [
+            PartInfo(box_a, "A", box_a.bounds[0], box_a.bounds[1],
+                     box_a.bounds[1] - box_a.bounds[0]),
+            PartInfo(far_box, "F", far_box.bounds[0], far_box.bounds[1],
+                     far_box.bounds[1] - far_box.bounds[0]),
+        ]
+        pairs = gen.find_adjacent_pairs(infos)
+        assert len(pairs) == 0
+
+    def test_find_adjacent_pairs_empty(self, gen):
+        assert gen.find_adjacent_pairs([]) == []
+
+    # -- pin placement --
+
+    def test_place_pins_on_plane(self, gen):
+        """Place pins on a flat 20x20 mm face on XY plane."""
+        normal = np.array([0.0, 0.0, 1.0])
+        face_verts = np.array([
+            [-10, -10, 0],
+            [10, -10, 0],
+            [10, 10, 0],
+            [-10, 10, 0],
+        ], dtype=np.float64)
+
+        positions = gen.place_pins(face_verts, normal)
+        assert len(positions) >= 2  # at least min_pins_per_face
+        # All positions should be on the z=0 plane
+        for pos in positions:
+            assert abs(pos[2]) < 0.01
+
+    def test_place_pins_small_face(self, gen):
+        """Very small face should still produce at least 1 pin at centroid."""
+        normal = np.array([0.0, 0.0, 1.0])
+        # Two points only
+        face_verts = np.array([[0, 0, 0], [1, 0, 0]], dtype=np.float64)
+        positions = gen.place_pins(face_verts, normal)
+        assert len(positions) == 1
+
+    # -- pin/hole mesh creation --
+
+    def test_create_pin_mesh(self, gen):
+        pos = np.array([0.0, 0.0, 0.0])
+        direction = np.array([0.0, 0.0, 1.0])
+        pin = gen.create_pin_mesh(pos, direction)
+        assert isinstance(pin, trimesh.Trimesh)
+        assert len(pin.vertices) > 0
+        assert len(pin.faces) > 0
+
+    def test_create_hole_mesh(self, gen):
+        pos = np.array([0.0, 0.0, 0.0])
+        direction = np.array([0.0, 0.0, 1.0])
+        hole = gen.create_hole_mesh(pos, direction)
+        assert isinstance(hole, trimesh.Trimesh)
+        assert len(hole.vertices) > 0
+        assert len(hole.faces) > 0
+
+    # -- rotation helper --
+
+    def test_rotation_from_to_identity(self):
+        src = np.array([0.0, 0.0, 1.0])
+        dst = np.array([0.0, 0.0, 1.0])
+        mat = PinHoleGenerator._rotation_from_to(src, dst)
+        assert np.allclose(mat, np.eye(4), atol=1e-6)
+
+    def test_rotation_from_to_90_degrees(self):
+        src = np.array([0.0, 0.0, 1.0])
+        dst = np.array([1.0, 0.0, 0.0])
+        mat = PinHoleGenerator._rotation_from_to(src, dst)
+        # Applying rotation to src should give dst
+        result = mat[:3, :3] @ src
+        assert np.allclose(result, dst, atol=1e-6)
+
+    # -- full generate flow --
+
+    def test_generate_no_adjacent_parts(self, gen, box_a, far_box):
+        infos = [
+            PartInfo(box_a, "A", box_a.bounds[0], box_a.bounds[1],
+                     box_a.bounds[1] - box_a.bounds[0]),
+            PartInfo(far_box, "F", far_box.bounds[0], far_box.bounds[1],
+                     far_box.bounds[1] - far_box.bounds[0]),
+        ]
+        result = gen.generate(infos)
+        # Should return same number of parts unchanged
+        assert len(result) == 2
+        # Vertices should be unchanged (no connectors applied)
+        assert np.allclose(result[0].mesh.vertices, box_a.vertices)
