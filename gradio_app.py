@@ -706,18 +706,81 @@ def build_app():
             if not _PARTSEG_AVAILABLE:
                 raise gr.Error("Part segmentation is not available. Check dependencies (spconv, torch_scatter, etc.).")
 
-            # Move shape pipeline to CPU to free VRAM for P3-SAM
+            # ---- Aggressive memory cleanup before segmentation ----
+            import gc
+            import logging
+            _mem_logger = logging.getLogger("gradio.memory")
+
+            # Log current GPU state
+            free_mb = torch.cuda.mem_get_info()[0] / (1024 * 1024) if torch.cuda.is_available() else -1
+            total_mb = torch.cuda.mem_get_info()[1] / (1024 * 1024) if torch.cuda.is_available() else -1
+            _mem_logger.info(
+                "[SEGMENT] GPU before cleanup: %.0f MB free / %.0f MB total",
+                free_mb, total_mb,
+            )
+
+            # Move shape pipeline to CPU and aggressively free GPU memory
             if model_mgr.shape_pipeline is not None:
                 model_mgr.shape_pipeline.to('cpu')
-            torch.cuda.empty_cache()
+            if hasattr(model_mgr, 'tex_pipeline') and model_mgr.tex_pipeline is not None:
+                try:
+                    model_mgr.tex_pipeline.to('cpu')
+                except Exception:
+                    pass
+
+            # Triple cleanup: gc + empty_cache repeated
+            for _ in range(3):
+                gc.collect()
+                torch.cuda.empty_cache()
+
+            free_mb = torch.cuda.mem_get_info()[0] / (1024 * 1024) if torch.cuda.is_available() else -1
+            _mem_logger.info(
+                "[SEGMENT] GPU after cleanup: %.0f MB free / %.0f MB total",
+                free_mb, total_mb,
+            )
+
+            if free_mb > 0 and free_mb < 2000:
+                _mem_logger.warning(
+                    "[SEGMENT] Low GPU memory (%.0f MB free) — segmentation may fail or crash. "
+                    "Consider restarting with --low_vram_mode.",
+                    free_mb,
+                )
 
             mesh = trimesh.load(mesh_path, force='mesh', process=False)
-            aabb, face_ids = _partseg_mgr.segment(mesh, seed=seed)
+            _mem_logger.info(
+                "[SEGMENT] Mesh loaded: %d verts, %d faces",
+                len(mesh.vertices), len(mesh.faces),
+            )
 
-            # Restore shape pipeline to GPU
+            try:
+                aabb, face_ids = _partseg_mgr.segment(mesh, seed=seed)
+            except Exception as seg_exc:
+                _mem_logger.error("[SEGMENT] Segmentation failed: %s", seg_exc)
+                # Attempt recovery
+                gc.collect()
+                torch.cuda.empty_cache()
+                raise gr.Error(f"Segmentation failed (likely out of GPU memory): {seg_exc}")
+
+            free_mb = torch.cuda.mem_get_info()[0] / (1024 * 1024) if torch.cuda.is_available() else -1
+            _mem_logger.info("[SEGMENT] Done — GPU: %.0f MB free", free_mb)
+
+            # CRITICAL: Unload P3-SAM from GPU to free VRAM for XPart
+            try:
+                _partseg_mgr.unload_automask()
+            except Exception as unload_exc:
+                _mem_logger.warning("[SEGMENT] Failed to unload P3-SAM: %s", unload_exc)
+
+            # Restore shape pipeline to GPU only if there's enough memory
             if model_mgr.shape_pipeline is not None:
-                model_mgr.shape_pipeline.to('cuda')
+                free_mb = torch.cuda.mem_get_info()[0] / (1024 * 1024) if torch.cuda.is_available() else 99999
+                if free_mb > 4000:
+                    model_mgr.shape_pipeline.to('cuda')
+                else:
+                    _mem_logger.warning("[SEGMENT] Not enough GPU memory to restore shape pipeline — leaving on CPU")
+            gc.collect()
             torch.cuda.empty_cache()
+            # Free local mesh references
+            del mesh, mesh_save
 
             # Color the mesh by part ID
             import numpy as np
@@ -757,6 +820,10 @@ def build_app():
         def on_generate_parts(part_state, seed):
             """Run XPart to generate completed parts."""
             import pickle as _pickle
+            import gc
+            import logging
+            _mem_logger = logging.getLogger("gradio.memory")
+
             if part_state is None or not isinstance(part_state, dict) or 'aabb_pkl' not in part_state:
                 raise gr.Error("Please run 'Segment Parts' first.")
             if not os.path.exists(part_state['aabb_pkl']):
@@ -767,18 +834,49 @@ def build_app():
             aabb = saved['aabb']
             mesh_path = saved['mesh_path']
 
-            # Move shape pipeline to CPU to free VRAM for XPart
+            free_mb = torch.cuda.mem_get_info()[0] / (1024 * 1024) if torch.cuda.is_available() else -1
+            total_mb = torch.cuda.mem_get_info()[1] / (1024 * 1024) if torch.cuda.is_available() else -1
+            _mem_logger.info("[XPart] GPU before cleanup: %.0f MB free / %.0f MB total", free_mb, total_mb)
+
+            # Aggressive cleanup before XPart — ensure P3-SAM is off GPU
             if model_mgr.shape_pipeline is not None:
                 model_mgr.shape_pipeline.to('cpu')
+            try:
+                _partseg_mgr.unload_automask()
+            except Exception as unload_exc:
+                _mem_logger.warning("[XPart] Failed to unload P3-SAM: %s", unload_exc)
+            gc.collect()
+            torch.cuda.empty_cache()
+            gc.collect()
             torch.cuda.empty_cache()
 
-            obj_mesh, bbox_mesh, explode_mesh = _partseg_mgr.generate_parts(
-                mesh_path, aabb, seed=seed
-            )
+            free_mb = torch.cuda.mem_get_info()[0] / (1024 * 1024) if torch.cuda.is_available() else -1
+            _mem_logger.info("[XPart] GPU after cleanup: %.0f MB free", free_mb)
 
-            # Restore shape pipeline to GPU
+            try:
+                obj_mesh, bbox_mesh, explode_mesh = _partseg_mgr.generate_parts(
+                    mesh_path, aabb, seed=seed
+                )
+            except Exception as xp_exc:
+                _mem_logger.error("[XPart] Part generation failed: %s", xp_exc)
+                gc.collect()
+                torch.cuda.empty_cache()
+                raise gr.Error(f"Part generation failed (likely out of GPU memory): {xp_exc}")
+
+            _mem_logger.info("[XPart] Done")
+
+            # CRITICAL: Unload XPart from GPU to free VRAM
+            try:
+                _partseg_mgr.unload_pipeline()
+            except Exception as unload_exc:
+                _mem_logger.warning("[XPart] Failed to unload XPart: %s", unload_exc)
+
+            # Restore shape pipeline only if there's memory
             if model_mgr.shape_pipeline is not None:
-                model_mgr.shape_pipeline.to('cuda')
+                free_mb = torch.cuda.mem_get_info()[0] / (1024 * 1024) if torch.cuda.is_available() else 99999
+                if free_mb > 4000:
+                    model_mgr.shape_pipeline.to('cuda')
+            gc.collect()
             torch.cuda.empty_cache()
 
             save_folder = gen_save_folder()

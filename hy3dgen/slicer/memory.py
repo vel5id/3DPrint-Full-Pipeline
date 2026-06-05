@@ -55,7 +55,7 @@ def get_gpu_memory_info(device_id: int = 0) -> Dict[str, float]:
                 "utilization_pct": 0.0}
 
     try:
-        total = torch.cuda.get_device_properties(device_id).total_mem
+        total = torch.cuda.get_device_properties(device_id).total_memory
         reserved = torch.cuda.memory_reserved(device_id)
         allocated = torch.cuda.memory_allocated(device_id)
         total_mb = total / (1024.0 * 1024.0)

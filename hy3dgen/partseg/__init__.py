@@ -44,6 +44,7 @@ class PartSegManager:
         self._automask = None
         self._pipeline = None
         self._loaded = False
+        self._device = None
 
     # ------------------------------------------------------------------
     # Lazy loading
@@ -59,22 +60,49 @@ class PartSegManager:
             'pipeline'  — load only XPart (for part generation).
             'all'       — load both (not recommended on 16 GB GPUs).
         """
+        import torch
+
+        if self._device is None:
+            self._device = "cuda" if torch.cuda.is_available() else "cpu"
+
         if which in ("auto_mask", "all") and self._automask is None:
-            import torch
             gc.collect()
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
+
+            logger.info(
+                "[MEM] Before loading P3-SAM: GPU %.0f MB free / %.0f MB total",
+                (torch.cuda.get_device_properties(0).total_memory
+                 - torch.cuda.memory_reserved(0)) / 1e6
+                if torch.cuda.is_available() else 0,
+                torch.cuda.get_device_properties(0).total_memory / 1e6
+                if torch.cuda.is_available() else 0,
+            )
 
             # --- P3-SAM ---
             from demo.auto_mask import AutoMask
             self._automask = AutoMask(ckpt_path=None)  # None = auto-download from HF
             logger.info("P3-SAM AutoMask loaded")
 
+            if torch.cuda.is_available():
+                logger.info(
+                    "[MEM] After P3-SAM load: GPU %.0f MB used / %.0f MB total",
+                    torch.cuda.memory_reserved(0) / 1e6,
+                    torch.cuda.get_device_properties(0).total_memory / 1e6,
+                )
+
         if which in ("pipeline", "all") and self._pipeline is None:
-            import torch
             gc.collect()
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
+
+            logger.info(
+                "[MEM] Before loading XPart: GPU %.0f MB used / %.0f MB total",
+                torch.cuda.memory_reserved(0) / 1e6
+                if torch.cuda.is_available() else 0,
+                torch.cuda.get_device_properties(0).total_memory / 1e6
+                if torch.cuda.is_available() else 0,
+            )
 
             # --- XPart ---
             from partgen.partformer_pipeline import PartFormerPipeline
@@ -90,19 +118,91 @@ class PartSegManager:
                 model_path="tencent/Hunyuan3D-Part",
                 verbose=True,
             )
-            device = "cuda" if torch.cuda.is_available() else "cpu"
-            self._pipeline.to(device=device, dtype=torch.float32)
+            self._pipeline.to(device=self._device, dtype=torch.float32)
             logger.info("XPart PartFormerPipeline loaded")
+
+            if torch.cuda.is_available():
+                logger.info(
+                    "[MEM] After XPart load: GPU %.0f MB used / %.0f MB total",
+                    torch.cuda.memory_reserved(0) / 1e6,
+                    torch.cuda.get_device_properties(0).total_memory / 1e6,
+                )
 
         if which == "all":
             self._loaded = True
+
+    # ------------------------------------------------------------------
+    # Model unloading (critical for OOM prevention)
+    # ------------------------------------------------------------------
+
+    def unload_automask(self):
+        """Move P3-SAM model to CPU and free GPU memory.
+
+        Call this after :meth:`segment` before loading XPart, to prevent
+        both models from occupying GPU simultaneously.
+        """
+        if self._automask is None:
+            return
+        import torch
+
+        logger.info("Moving P3-SAM to CPU and freeing GPU memory...")
+        self._automask.model.cpu()
+        self._automask.model_parallel.cpu()
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+        logger.info(
+            "[MEM] After P3-SAM unload: GPU %.0f MB free / %.0f MB total",
+            (torch.cuda.get_device_properties(0).total_memory
+             - torch.cuda.memory_reserved(0)) / 1e6
+            if torch.cuda.is_available() else 0,
+            torch.cuda.get_device_properties(0).total_memory / 1e6
+            if torch.cuda.is_available() else 0,
+        )
+
+    def unload_pipeline(self):
+        """Move XPart pipeline to CPU and free GPU memory.
+
+        Call this after :meth:`generate_parts` to release GPU for
+        subsequent shape/texture operations.
+        """
+        if self._pipeline is None:
+            return
+        import torch
+
+        logger.info("Moving XPart pipeline to CPU and freeing GPU memory...")
+        self._pipeline.to(device="cpu")
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+        logger.info(
+            "[MEM] After XPart unload: GPU %.0f MB free / %.0f MB total",
+            (torch.cuda.get_device_properties(0).total_memory
+             - torch.cuda.memory_reserved(0)) / 1e6
+            if torch.cuda.is_available() else 0,
+            torch.cuda.get_device_properties(0).total_memory / 1e6
+            if torch.cuda.is_available() else 0,
+        )
+
+    def free_all(self):
+        """Unload ALL part-segmentation models from GPU."""
+        self.unload_automask()
+        self.unload_pipeline()
+        import torch
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        logger.info("All part-segmentation models freed from GPU")
 
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
 
     def segment(self, mesh, postprocess: bool = True,
-                threshold: float = 0.95, seed: int = 42):
+                threshold: float = 0.95, seed: int = 42,
+                prompt_bs: int = 8):
         """
         Run P3-SAM segmentation on a trimesh.
 
@@ -116,6 +216,9 @@ class PartSegManager:
             Post-processing threshold (lower = more merging).
         seed : int
             Random seed for reproducibility.
+        prompt_bs : int
+            Prompt batch size for P3-SAM inference. Lower values (4-8)
+            reduce peak GPU memory at the cost of speed. Default: 8.
 
         Returns
         -------
@@ -125,15 +228,26 @@ class PartSegManager:
             Per-face part labels.  -1 = unassigned.
         """
         self._ensure_loaded(which="auto_mask")
+        import torch
         import numpy as np
 
+        logger.info("[MEM] Starting P3-SAM segmentation (prompt_bs=%d)...", prompt_bs)
         aabb, face_ids, _ = self._automask.predict_aabb(
             mesh,
             seed=seed,
             is_parallel=False,
             post_process=postprocess,
             threshold=threshold,
+            prompt_bs=prompt_bs,
         )
+
+        # Free GPU tensors from P3-SAM inference
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+        logger.info("P3-SAM segmentation complete: %d parts found",
+                    len(aabb) if aabb is not None else 0)
         return aabb, face_ids
 
     def generate_parts(self, mesh_path: str, aabb, seed: int = 42):
@@ -160,16 +274,26 @@ class PartSegManager:
             Exploded view of the parts.
         """
         self._ensure_loaded(which="pipeline")
+        import torch
         import pytorch_lightning as pl
 
         pl.seed_everything(int(seed), workers=True)
         additional_params = {"output_type": "trimesh"}
+
+        logger.info("[MEM] Starting XPart part generation...")
         obj_mesh, (out_bbox, mesh_gt_bbox, explode_object) = self._pipeline(
             mesh_path=mesh_path,
             aabb=aabb,
             octree_resolution=512,
             **additional_params,
         )
+
+        # Free GPU tensors from XPart inference
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+        logger.info("XPart generation complete")
         return obj_mesh, out_bbox, explode_object
 
     @property

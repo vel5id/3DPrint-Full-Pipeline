@@ -153,32 +153,34 @@ def get_mask(model, feats, points, point_prompt, iter=1):
     """
     point_num = points.shape[0]
     prompt_num = point_prompt.shape[0]
-    feats = feats.unsqueeze(1)  # [N, 1, 512]
-    feats = feats.repeat(1, prompt_num, 1).cuda()  # [N, K, 512]
-    points = torch.from_numpy(points).float().cuda().unsqueeze(1)  # [N, 1, 3]
-    points = points.repeat(1, prompt_num, 1)  # [N, K, 3]
+    feats_exp = feats.unsqueeze(1)  # [N, 1, 512]
+    feats_exp = feats_exp.repeat(1, prompt_num, 1).cuda()  # [N, K, 512]
+    pts_t = torch.from_numpy(points).float().cuda().unsqueeze(1)  # [N, 1, 3]
+    pts_t = pts_t.repeat(1, prompt_num, 1)  # [N, K, 3]
     prompt_coord = (
         torch.from_numpy(point_prompt).float().cuda().unsqueeze(0)
     )  # [1, K, 3]
     prompt_coord = prompt_coord.repeat(point_num, 1, 1)  # [N, K, 3]
-    
-    feats = feats.transpose(0, 1)  # [K, N, 512]
-    points = points.transpose(0, 1)  # [K, N, 3]
+
+    feats_exp = feats_exp.transpose(0, 1)  # [K, N, 512]
+    pts_t = pts_t.transpose(0, 1)  # [K, N, 3]
     prompt_coord = prompt_coord.transpose(0, 1)  # [K, N, 3]
 
-    mask_1, mask_2, mask_3, pred_iou = model(feats, points, prompt_coord, iter)
+    mask_1, mask_2, mask_3, pred_iou = model(feats_exp, pts_t, prompt_coord, iter)
 
     mask_1 = mask_1.transpose(0, 1)  # [N, K]
     mask_2 = mask_2.transpose(0, 1)  # [N, K]
     mask_3 = mask_3.transpose(0, 1)  # [N, K]
 
-    mask_1 = mask_1.detach().cpu().numpy() > 0.5
-    mask_2 = mask_2.detach().cpu().numpy() > 0.5
-    mask_3 = mask_3.detach().cpu().numpy() > 0.5
+    mask_1_np = mask_1.detach().cpu().numpy() > 0.5
+    mask_2_np = mask_2.detach().cpu().numpy() > 0.5
+    mask_3_np = mask_3.detach().cpu().numpy() > 0.5
+    org_iou_np = pred_iou.detach().cpu().numpy()  # [K, 3]
 
-    org_iou = pred_iou.detach().cpu().numpy()  # [K, 3]
+    # CRITICAL: Free all GPU tensors to prevent VRAM/RAM leak
+    del feats_exp, pts_t, prompt_coord, mask_1, mask_2, mask_3, pred_iou
 
-    return mask_1, mask_2, mask_3, org_iou
+    return mask_1_np, mask_2_np, mask_3_np, org_iou_np
 
 
 def cal_iou(m1, m2):
@@ -842,7 +844,13 @@ def mesh_sam(
             for j in range(max_idx.shape[0]):
                 mask_res.append(pred_mask[:, j, max_idx[j]])
                 iou_res.append(pred_iou[j, max_idx[j]])
+            # Free intermediate numpy arrays from this iteration
+            del pred_mask_1, pred_mask_2, pred_mask_3, pred_iou, pred_mask, max_idx
     mask_res = np.stack(mask_res, axis=-1)  # [N, K]
+    # Free the large _feats tensor after inference
+    del _feats
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
     if show_info:
         print("prmopt 推理完成")
 
