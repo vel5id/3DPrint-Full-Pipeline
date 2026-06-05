@@ -700,128 +700,136 @@ def build_app():
             print(f"Part segmentation unavailable: {e}")
 
         def on_segment_parts(mesh_path, seed):
-            """Run P3-SAM segmentation on the generated mesh."""
+            """Run P3-SAM segmentation on the generated mesh — with live progress."""
+            import gc, time
+            import numpy as np
+            import pickle as _pickle
+            import logging
+            _mem_logger = logging.getLogger("gradio.memory")
+
             if mesh_path is None:
                 raise gr.Error("Please generate a mesh first (click Gen Shape or Gen Textured Shape).")
             if not _PARTSEG_AVAILABLE:
                 raise gr.Error("Part segmentation is not available. Check dependencies (spconv, torch_scatter, etc.).")
 
-            # ---- Aggressive memory cleanup before segmentation ----
-            import gc
-            import logging
-            _mem_logger = logging.getLogger("gradio.memory")
-
-            # Log current GPU state
-            free_mb = torch.cuda.mem_get_info()[0] / (1024 * 1024) if torch.cuda.is_available() else -1
-            total_mb = torch.cuda.mem_get_info()[1] / (1024 * 1024) if torch.cuda.is_available() else -1
-            _mem_logger.info(
-                "[SEGMENT] GPU before cleanup: %.0f MB free / %.0f MB total",
-                free_mb, total_mb,
+            # ---- Phase 1: GPU Cleanup (yield status) ----
+            gpu_total = torch.cuda.get_device_properties(0).total_memory / 1e6 if torch.cuda.is_available() else 0
+            gpu_name = torch.cuda.get_device_name(0) if torch.cuda.is_available() else "CPU"
+            yield None, None, None, (
+                f"**🧹 Phase 1/5: Freeing GPU memory**\n\n"
+                f"**Device:** {gpu_name} ({gpu_total:.0f} MB)\n"
+                f"Moving shape model to CPU..."
             )
 
-            # Move shape pipeline to CPU and aggressively free GPU memory
             if model_mgr.shape_pipeline is not None:
                 model_mgr.shape_pipeline.to('cpu')
             if hasattr(model_mgr, 'tex_pipeline') and model_mgr.tex_pipeline is not None:
-                try:
-                    model_mgr.tex_pipeline.to('cpu')
-                except Exception:
-                    pass
+                try: model_mgr.tex_pipeline.to('cpu')
+                except Exception: pass
 
-            # Triple cleanup: gc + empty_cache repeated
             for _ in range(3):
                 gc.collect()
                 torch.cuda.empty_cache()
 
-            free_mb = torch.cuda.mem_get_info()[0] / (1024 * 1024) if torch.cuda.is_available() else -1
-            _mem_logger.info(
-                "[SEGMENT] GPU after cleanup: %.0f MB free / %.0f MB total",
-                free_mb, total_mb,
+            free_mb = torch.cuda.mem_get_info()[0] / 1e6 if torch.cuda.is_available() else -1
+            yield None, None, None, (
+                f"**🧹 Phase 1/5: GPU Cleanup — done**\n\n"
+                f"**Free VRAM:** {free_mb:.0f} / {gpu_total:.0f} MB\n"
+                f"Loading mesh..."
             )
 
-            if free_mb > 0 and free_mb < 2000:
-                _mem_logger.warning(
-                    "[SEGMENT] Low GPU memory (%.0f MB free) — segmentation may fail or crash. "
-                    "Consider restarting with --low_vram_mode.",
-                    free_mb,
-                )
-
+            # ---- Phase 2: Load Mesh ----
             mesh = trimesh.load(mesh_path, force='mesh', process=False)
-            _mem_logger.info(
-                "[SEGMENT] Mesh loaded: %d verts, %d faces",
-                len(mesh.vertices), len(mesh.faces),
+            nv, nf = len(mesh.vertices), len(mesh.faces)
+            est_time = "2-4 min" if nf < 50000 else "4-6 min"
+
+            yield None, None, None, (
+                f"**📂 Phase 2/5: Mesh Loaded**\n\n"
+                f"**Vertices:** {nv:,}  |  **Faces:** {nf:,}\n"
+                f"**Estimated time:** {est_time} (GPU inference)\n\n"
+                f"**🚀 Phase 3/5: P3-SAM Segmentation (GPU)...**\n"
+                f"• Sampling 100K surface points\n"
+                f"• Extracting Sonata 3D features\n"
+                f"• 400 prompt points × FPS sampling\n"
+                f"• ~50 batches of GPU inference\n"
+                f"• NMS clustering + label fixing\n"
+                f"⏳ Running — please wait..."
             )
 
+            # ---- Phase 3: Run P3-SAM ----
+            t0 = time.time()
             try:
                 aabb, face_ids = _partseg_mgr.segment(mesh, seed=seed)
             except Exception as seg_exc:
-                _mem_logger.error("[SEGMENT] Segmentation failed: %s", seg_exc)
-                # Attempt recovery
-                gc.collect()
-                torch.cuda.empty_cache()
+                gc.collect(); torch.cuda.empty_cache()
                 raise gr.Error(f"Segmentation failed (likely out of GPU memory): {seg_exc}")
 
-            free_mb = torch.cuda.mem_get_info()[0] / (1024 * 1024) if torch.cuda.is_available() else -1
-            _mem_logger.info("[SEGMENT] Done — GPU: %.0f MB free", free_mb)
+            elapsed = time.time() - t0
+            unique_ids = np.unique(face_ids)
+            n_parts = len(unique_ids) - (1 if -1 in unique_ids else 0)
 
-            # CRITICAL: Unload P3-SAM from GPU to free VRAM for XPart
+            free_mb = torch.cuda.mem_get_info()[0] / 1e6 if torch.cuda.is_available() else -1
+            yield None, None, None, (
+                f"**✅ Phase 3/5: Segmentation Complete**\n\n"
+                f"**Parts found:** {n_parts}\n"
+                f"**Time:** {elapsed:.0f}s (~{elapsed/60:.1f} min)\n"
+                f"**Free VRAM:** {free_mb:.0f} / {gpu_total:.0f} MB\n\n"
+                f"**🎨 Phase 4/5: Unloading P3-SAM from GPU, coloring mesh...**"
+            )
+
+            # ---- Phase 4: Unload P3-SAM + Color ----
             try:
                 _partseg_mgr.unload_automask()
             except Exception as unload_exc:
-                _mem_logger.warning("[SEGMENT] Failed to unload P3-SAM: %s", unload_exc)
+                _mem_logger.warning("Failed to unload P3-SAM: %s", unload_exc)
 
-            # Restore shape pipeline to GPU only if there's enough memory
+            # Restore shape pipeline only if enough VRAM
             if model_mgr.shape_pipeline is not None:
-                free_mb = torch.cuda.mem_get_info()[0] / (1024 * 1024) if torch.cuda.is_available() else 99999
+                free_mb = torch.cuda.mem_get_info()[0] / 1e6 if torch.cuda.is_available() else 99999
                 if free_mb > 4000:
                     model_mgr.shape_pipeline.to('cuda')
-                else:
-                    _mem_logger.warning("[SEGMENT] Not enough GPU memory to restore shape pipeline — leaving on CPU")
-            gc.collect()
-            torch.cuda.empty_cache()
-            # Free local mesh references
-            del mesh, mesh_save
+            gc.collect(); torch.cuda.empty_cache()
 
-            # Color the mesh by part ID
-            import numpy as np
-            import pickle as _pickle
-            unique_ids = np.unique(face_ids)
+            # Color mesh by part ID
             color_map = {}
             for i in unique_ids:
-                if i == -1:
-                    continue
-                part_color = np.random.RandomState(int(i)).randint(0, 255, 3)
-                color_map[i] = part_color
-            face_colors = []
-            for i in face_ids:
-                if i == -1:
-                    face_colors.append([0, 0, 0])
-                else:
-                    face_colors.append(color_map[i])
-            face_colors = np.array(face_colors).astype(np.uint8)
+                if i == -1: continue
+                color_map[i] = np.random.RandomState(int(i)).randint(0, 255, 3)
+            face_colors = np.array(
+                [color_map.get(i, [0, 0, 0]) for i in face_ids]
+            ).astype(np.uint8)
             mesh_save = mesh.copy()
             mesh_save.visual.face_colors = face_colors
 
+            yield None, None, None, (
+                f"**🎨 Phase 4/5: Mesh Colored**\n\n"
+                f"**{n_parts} parts** found & colored\n"
+                f"**💾 Phase 5/5: Saving results...**"
+            )
+
+            # ---- Phase 5: Save ----
             save_folder = gen_save_folder()
             segmented_path = os.path.join(save_folder, 'segmented.glb')
             mesh_save.export(segmented_path)
             face_id_path = os.path.join(save_folder, 'face_ids.npy')
             np.save(face_id_path, face_ids)
 
-            # Store AABB and mesh_path in a pickle file (gr.State can't handle trimesh objects)
             aabb_pkl_path = os.path.join(save_folder, 'aabb.pkl')
             with open(aabb_pkl_path, 'wb') as f:
                 _pickle.dump({'aabb': aabb, 'mesh_path': mesh_path}, f)
 
-            # Only pass serializable paths through Gradio State
             part_state = {'aabb_pkl': aabb_pkl_path, 'mesh_path': mesh_path}
-            return segmented_path, face_id_path, part_state, f"**Done!** Found {len(unique_ids) - (1 if -1 in unique_ids else 0)} parts."
+            del mesh, mesh_save, face_colors
+            gc.collect()
+
+            yield segmented_path, face_id_path, part_state, (
+                f"**✅ Done!** Found **{n_parts} parts** in {elapsed:.0f}s.\n\n"
+                f"Click **'2. Generate Parts'** to create printable part meshes."
+            )
 
         def on_generate_parts(part_state, seed):
-            """Run XPart to generate completed parts."""
-            import pickle as _pickle
-            import gc
-            import logging
+            """Run XPart to generate completed parts — with live progress."""
+            import pickle as _pickle, gc, time, logging
             _mem_logger = logging.getLogger("gradio.memory")
 
             if part_state is None or not isinstance(part_state, dict) or 'aabb_pkl' not in part_state:
@@ -834,58 +842,87 @@ def build_app():
             aabb = saved['aabb']
             mesh_path = saved['mesh_path']
 
-            free_mb = torch.cuda.mem_get_info()[0] / (1024 * 1024) if torch.cuda.is_available() else -1
-            total_mb = torch.cuda.mem_get_info()[1] / (1024 * 1024) if torch.cuda.is_available() else -1
-            _mem_logger.info("[XPart] GPU before cleanup: %.0f MB free / %.0f MB total", free_mb, total_mb)
+            gpu_total = torch.cuda.get_device_properties(0).total_memory / 1e6 if torch.cuda.is_available() else 0
+            n_parts = len(aabb) if aabb is not None else 0
 
-            # Aggressive cleanup before XPart — ensure P3-SAM is off GPU
+            # ---- Phase 1: GPU Cleanup ----
+            yield None, None, (
+                f"**🧹 Phase 1/4: Freeing GPU memory**\n\n"
+                f"Moving models to CPU...\n"
+                f"Parts to generate: **{n_parts}**"
+            )
+
             if model_mgr.shape_pipeline is not None:
                 model_mgr.shape_pipeline.to('cpu')
-            try:
-                _partseg_mgr.unload_automask()
-            except Exception as unload_exc:
-                _mem_logger.warning("[XPart] Failed to unload P3-SAM: %s", unload_exc)
-            gc.collect()
-            torch.cuda.empty_cache()
-            gc.collect()
-            torch.cuda.empty_cache()
+            try: _partseg_mgr.unload_automask()
+            except Exception: pass
 
-            free_mb = torch.cuda.mem_get_info()[0] / (1024 * 1024) if torch.cuda.is_available() else -1
-            _mem_logger.info("[XPart] GPU after cleanup: %.0f MB free", free_mb)
+            gc.collect(); torch.cuda.empty_cache()
+            gc.collect(); torch.cuda.empty_cache()
+
+            free_mb = torch.cuda.mem_get_info()[0] / 1e6 if torch.cuda.is_available() else -1
+            est_min = max(1, n_parts * 0.5)
+            yield None, None, (
+                f"**🧹 Phase 1/4: GPU Cleanup — done**\n\n"
+                f"**Free VRAM:** {free_mb:.0f} / {gpu_total:.0f} MB\n"
+                f"**Parts:** {n_parts}\n\n"
+                f"**🚀 Phase 2/4: Loading XPart model (GPU)...**\n"
+                f"Downloading from HuggingFace if needed..."
+            )
+
+            # ---- Phase 2: Load XPart + Run ----
+            t0 = time.time()
+            yield None, None, (
+                f"**🚀 Phase 2/4: XPart Generation (GPU)...**\n\n"
+                f"**Parts:** {n_parts}\n"
+                f"**Estimated time:** {est_min:.0f}-{est_min*1.5:.0f} min\n"
+                f"• Per-part latent diffusion (50 steps each)\n"
+                f"• Marching cubes surface extraction\n"
+                f"⏳ Running — please wait..."
+            )
 
             try:
                 obj_mesh, bbox_mesh, explode_mesh = _partseg_mgr.generate_parts(
                     mesh_path, aabb, seed=seed
                 )
             except Exception as xp_exc:
-                _mem_logger.error("[XPart] Part generation failed: %s", xp_exc)
-                gc.collect()
-                torch.cuda.empty_cache()
+                gc.collect(); torch.cuda.empty_cache()
                 raise gr.Error(f"Part generation failed (likely out of GPU memory): {xp_exc}")
 
-            _mem_logger.info("[XPart] Done")
+            elapsed = time.time() - t0
+            free_mb = torch.cuda.mem_get_info()[0] / 1e6 if torch.cuda.is_available() else -1
+            yield None, None, (
+                f"**✅ Phase 2/4: Generation Complete**\n\n"
+                f"**Time:** {elapsed:.0f}s (~{elapsed/60:.1f} min)\n"
+                f"**Free VRAM:** {free_mb:.0f} / {gpu_total:.0f} MB\n\n"
+                f"**🧹 Phase 3/4: Unloading XPart from GPU...**"
+            )
 
-            # CRITICAL: Unload XPart from GPU to free VRAM
+            # ---- Phase 3: Unload XPart ----
             try:
                 _partseg_mgr.unload_pipeline()
             except Exception as unload_exc:
-                _mem_logger.warning("[XPart] Failed to unload XPart: %s", unload_exc)
+                _mem_logger.warning("Failed to unload XPart: %s", unload_exc)
 
-            # Restore shape pipeline only if there's memory
             if model_mgr.shape_pipeline is not None:
-                free_mb = torch.cuda.mem_get_info()[0] / (1024 * 1024) if torch.cuda.is_available() else 99999
+                free_mb = torch.cuda.mem_get_info()[0] / 1e6 if torch.cuda.is_available() else 99999
                 if free_mb > 4000:
                     model_mgr.shape_pipeline.to('cuda')
-            gc.collect()
-            torch.cuda.empty_cache()
+            gc.collect(); torch.cuda.empty_cache()
 
+            # ---- Phase 4: Save ----
             save_folder = gen_save_folder()
             parts_path = os.path.join(save_folder, 'parts.glb')
             explode_path = os.path.join(save_folder, 'exploded.glb')
             obj_mesh.export(parts_path)
             explode_mesh.export(explode_path)
 
-            return parts_path, explode_path, f"**Done!** Parts generated."
+            free_mb = torch.cuda.mem_get_info()[0] / 1e6 if torch.cuda.is_available() else -1
+            yield parts_path, explode_path, (
+                f"**✅ Done!** Parts generated in {elapsed:.0f}s.\n\n"
+                f"**Free VRAM:** {free_mb:.0f} / {gpu_total:.0f} MB\n\n"
+                f"The exploded view shows all parts separated."
+            )
 
         segment_btn.click(
             on_segment_parts,
