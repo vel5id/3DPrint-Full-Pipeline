@@ -8,6 +8,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
 import pytest
+import trimesh
 
 from hy3dgen.slicer.config import (
     ConnectorConfig,
@@ -131,3 +132,89 @@ class TestLoadProfile:
         assert "ender3" in BUILTIN_PROFILES
         assert "prusa_mk4" in BUILTIN_PROFILES
         assert len(BUILTIN_PROFILES) == 3
+
+
+# -----------------------------------------------------------------------
+# MeshCutter tests
+# -----------------------------------------------------------------------
+
+from hy3dgen.slicer.cutter import MeshCutter, PartInfo
+
+
+class TestPartInfo:
+    def test_creation(self):
+        mesh = trimesh.creation.box(extents=[10, 20, 30])
+        info = PartInfo(
+            mesh=mesh,
+            name="test_box",
+            bbox_min=mesh.bounds[0],
+            bbox_max=mesh.bounds[1],
+            bbox_size=mesh.bounds[1] - mesh.bounds[0],
+        )
+        assert info.name == "test_box"
+        assert info.bbox_size[0] == pytest.approx(10, abs=0.1)
+        assert info.bbox_size[1] == pytest.approx(20, abs=0.1)
+        assert info.bbox_size[2] == pytest.approx(30, abs=0.1)
+
+
+class TestMeshCutter:
+    @pytest.fixture
+    def cutter(self):
+        return MeshCutter(QIDI_Q2_PROFILE)
+
+    @pytest.fixture
+    def small_box(self):
+        return trimesh.creation.box(extents=[100, 100, 100])
+
+    @pytest.fixture
+    def large_box(self):
+        return trimesh.creation.box(extents=[300, 100, 50])
+
+    @pytest.fixture
+    def huge_box(self):
+        return trimesh.creation.box(extents=[500, 500, 500])
+
+    def test_small_part_fits(self, cutter, small_box):
+        info = cutter.check_part(small_box, "small")
+        assert info.fits_bed is True
+        assert info.name == "small"
+
+    def test_large_part_exceeds(self, cutter, large_box):
+        info = cutter.check_part(large_box, "large")
+        # 300 mm X exceeds 260 mm usable
+        assert info.fits_bed is False
+
+    def test_huge_part_exceeds(self, cutter, huge_box):
+        info = cutter.check_part(huge_box, "huge")
+        assert info.fits_bed is False
+
+    def test_empty_mesh_raises(self, cutter):
+        empty = trimesh.Trimesh()
+        with pytest.raises(ValueError, match="empty"):
+            cutter.check_part(empty, "empty")
+
+    def test_process_scene(self, cutter, small_box):
+        scene = trimesh.Scene()
+        scene.add_geometry(small_box, geom_name="box_a")
+        scene.add_geometry(
+            trimesh.creation.box(extents=[50, 50, 50]),
+            geom_name="box_b",
+        )
+        results = cutter.process(scene)
+        assert len(results) == 2
+        assert all(r.fits_bed for r in results)
+        assert results[0].name == "box_a"
+        assert results[1].name == "box_b"
+
+    def test_process_none(self, cutter):
+        assert cutter.process(None) == []
+
+    def test_process_skips_non_trimesh(self, cutter, small_box):
+        scene = trimesh.Scene()
+        scene.add_geometry(small_box, geom_name="valid")
+        # Add a Path3D which is not a Trimesh — cutter should skip it
+        path = trimesh.path.creation.box_outline()
+        scene.add_geometry(path, geom_name="skip_me")
+        results = cutter.process(scene)
+        assert len(results) == 1
+        assert results[0].name == "valid"
