@@ -28,8 +28,17 @@ from fastapi.staticfiles import StaticFiles
 import uuid
 
 from hy3dgen.shapegen.utils import logger
+from gradio_model_manager import (
+    ModelManager,
+    SHAPE_MODEL_CONFIGS,
+    TEX_MODEL_CONFIGS,
+    get_available_variants,
+)
 
 MAX_SEED = int(1e7)
+
+# model_mgr is initialized in __main__ and used by all generator functions
+model_mgr: ModelManager = None
 
 
 def get_example_img_list():
@@ -147,9 +156,9 @@ def _gen_shape(
     num_chunks=200000,
     randomize_seed: bool = False,
 ):
-    if not MV_MODE and image is None and caption is None:
+    if not model_mgr.is_mv_mode and image is None and caption is None:
         raise gr.Error("Please provide either a caption or an image.")
-    if MV_MODE:
+    if model_mgr.is_mv_mode:
         if mv_image_front is None and mv_image_back is None and mv_image_left is None and mv_image_right is None:
             raise gr.Error("Please provide at least one view image.")
         image = {}
@@ -169,8 +178,8 @@ def _gen_shape(
     save_folder = gen_save_folder()
     stats = {
         'model': {
-            'shapegen': f'{args.model_path}/{args.subfolder}',
-            'texgen': f'{args.texgen_model_path}',
+            'shapegen': f'{model_mgr.current_repo}/{model_mgr.current_subfolder}',
+            'texgen': f'{model_mgr.current_tex_display}',
         },
         'params': {
             'caption': caption,
@@ -187,24 +196,24 @@ def _gen_shape(
     if image is None:
         start_time = time.time()
         try:
-            image = t2i_worker(caption)
+            image = model_mgr.t2i_worker(caption)
         except Exception as e:
             raise gr.Error(f"Text to 3D is disable. Please enable it by `python gradio_app.py --enable_t23d`.")
         time_meta['text2image'] = time.time() - start_time
 
     # remove disk io to make responding faster, uncomment at your will.
     # image.save(os.path.join(save_folder, 'input.png'))
-    if MV_MODE:
+    if model_mgr.is_mv_mode:
         start_time = time.time()
         for k, v in image.items():
             if check_box_rembg or v.mode == "RGB":
-                img = rmbg_worker(v.convert('RGB'))
+                img = model_mgr.rmbg_worker(v.convert('RGB'))
                 image[k] = img
         time_meta['remove background'] = time.time() - start_time
     else:
         if check_box_rembg or image.mode == "RGB":
             start_time = time.time()
-            image = rmbg_worker(image.convert('RGB'))
+            image = model_mgr.rmbg_worker(image.convert('RGB'))
             time_meta['remove background'] = time.time() - start_time
 
     # remove disk io to make responding faster, uncomment at your will.
@@ -215,27 +224,44 @@ def _gen_shape(
 
     generator = torch.Generator()
     generator = generator.manual_seed(int(seed))
-    outputs = i23d_worker(
-        image=image,
-        num_inference_steps=steps,
-        guidance_scale=guidance_scale,
-        generator=generator,
-        octree_resolution=octree_resolution,
-        num_chunks=num_chunks,
-        output_type='mesh'
-    )
-    time_meta['shape generation'] = time.time() - start_time
-    logger.info("---Shape generation takes %s seconds ---" % (time.time() - start_time))
 
-    tmp_start = time.time()
-    mesh = export_to_trimesh(outputs)[0]
-    time_meta['export to trimesh'] = time.time() - tmp_start
+    if model_mgr.is_omni:
+        # Omni pipeline: returns {'shapes': [mesh], ...}
+        outputs = model_mgr.shape_pipeline(
+            image=image,
+            num_inference_steps=steps,
+            guidance_scale=guidance_scale,
+            generator=generator,
+            octree_resolution=octree_resolution,
+            num_chunks=num_chunks,
+            output_type='trimesh',
+        )
+        time_meta['shape generation'] = time.time() - start_time
+        logger.info("---Shape generation takes %s seconds ---" % (time.time() - start_time))
+        tmp_start = time.time()
+        mesh = outputs['shapes'][0]  # trimesh already
+        time_meta['export to trimesh'] = time.time() - tmp_start
+    else:
+        outputs = model_mgr.shape_pipeline(
+            image=image,
+            num_inference_steps=steps,
+            guidance_scale=guidance_scale,
+            generator=generator,
+            octree_resolution=octree_resolution,
+            num_chunks=num_chunks,
+            output_type='mesh'
+        )
+        time_meta['shape generation'] = time.time() - start_time
+        logger.info("---Shape generation takes %s seconds ---" % (time.time() - start_time))
+        tmp_start = time.time()
+        mesh = export_to_trimesh(outputs)[0]
+        time_meta['export to trimesh'] = time.time() - tmp_start
 
     stats['number_of_faces'] = mesh.faces.shape[0]
     stats['number_of_vertices'] = mesh.vertices.shape[0]
 
     stats['time'] = time_meta
-    main_image = image if not MV_MODE else image['front']
+    main_image = image if not model_mgr.is_mv_mode else image['front']
     return mesh, main_image, save_folder, stats, seed
 
 
@@ -279,12 +305,12 @@ def generation_all(
     # stats['time']['postprocessing'] = time.time() - tmp_time
 
     tmp_time = time.time()
-    mesh = face_reduce_worker(mesh)
+    mesh = model_mgr.face_reducer(mesh)
     logger.info("---Face Reduction takes %s seconds ---" % (time.time() - tmp_time))
     stats['time']['face reduction'] = time.time() - tmp_time
 
     tmp_time = time.time()
-    textured_mesh = texgen_worker(mesh, image)
+    textured_mesh = model_mgr.tex_pipeline(mesh, image)
     logger.info("---Texture Generation takes %s seconds ---" % (time.time() - tmp_time))
     stats['time']['texture generation'] = time.time() - tmp_time
     stats['time']['total'] = time.time() - start_time_0
@@ -293,7 +319,7 @@ def generation_all(
     path_textured = export_mesh(textured_mesh, save_folder, textured=True)
     model_viewer_html_textured = build_model_viewer_html(save_folder, height=HTML_HEIGHT, width=HTML_WIDTH,
                                                          textured=True)
-    if args.low_vram_mode:
+    if model_mgr.low_vram_mode:
         torch.cuda.empty_cache()
     return (
         gr.update(value=path),
@@ -340,7 +366,7 @@ def shape_generation(
 
     path = export_mesh(mesh, save_folder, textured=False)
     model_viewer_html = build_model_viewer_html(save_folder, height=HTML_HEIGHT, width=HTML_WIDTH)
-    if args.low_vram_mode:
+    if model_mgr.low_vram_mode:
         torch.cuda.empty_cache()
     return (
         gr.update(value=path),
@@ -352,11 +378,11 @@ def shape_generation(
 
 def build_app():
     title = 'Hunyuan3D-2: High Resolution Textured 3D Assets Generation'
-    if MV_MODE:
+    if model_mgr.is_mv_mode:
         title = 'Hunyuan3D-2mv: Image to 3D Generation with 1-4 Views'
-    if 'mini' in args.subfolder:
+    if 'mini' in model_mgr.current_subfolder:
         title = 'Hunyuan3D-2mini: Strong 0.6B Image to Shape Generator'
-    if TURBO_MODE:
+    if model_mgr.is_turbo:
         title = title.replace(':', '-Turbo: Fast ')
 
     title_html = f"""
@@ -394,15 +420,15 @@ def build_app():
 
         with gr.Row():
             with gr.Column(scale=3):
-                with gr.Tabs(selected='tab_img_prompt') as tabs_prompt:
-                    with gr.Tab('Image Prompt', id='tab_img_prompt', visible=not MV_MODE) as tab_ip:
+                with gr.Column():
+                    with gr.Accordion('Image Prompt', open=not model_mgr.is_mv_mode, visible=not model_mgr.is_mv_mode) as tab_ip:
                         image = gr.Image(label='Image', type='pil', image_mode='RGBA', height=290)
 
-                    with gr.Tab('Text Prompt', id='tab_txt_prompt', visible=HAS_T2I and not MV_MODE) as tab_tp:
+                    with gr.Accordion('Text Prompt', open=False, visible=HAS_T2I and not model_mgr.is_mv_mode) as tab_tp:
                         caption = gr.Textbox(label='Text Prompt',
                                              placeholder='HunyuanDiT will be used to generate image.',
                                              info='Example: A 3D model of a cute cat, white background')
-                    with gr.Tab('MultiView Prompt', visible=MV_MODE) as tab_mv:
+                    with gr.Accordion('MultiView Prompt', open=model_mgr.is_mv_mode, visible=model_mgr.is_mv_mode) as tab_mv:
                         # gr.Label('Please upload at least one front image.')
                         with gr.Row():
                             mv_image_front = gr.Image(label='Front', type='pil', image_mode='RGBA', height=140,
@@ -426,16 +452,39 @@ def build_app():
                     file_out = gr.File(label="File", visible=False)
                     file_out2 = gr.File(label="File", visible=False)
 
-                with gr.Tabs(selected='tab_options' if TURBO_MODE else 'tab_export'):
-                    with gr.Tab("Options", id='tab_options', visible=TURBO_MODE):
-                        gen_mode = gr.Radio(label='Generation Mode',
-                                            info='Recommendation: Turbo for most cases, Fast for very complex cases, Standard seldom use.',
-                                            choices=['Turbo', 'Fast', 'Standard'], value='Turbo')
-                        decode_mode = gr.Radio(label='Decoding Mode',
-                                               info='The resolution for exporting mesh from generated vectset',
-                                               choices=['Low', 'Standard', 'High'],
-                                               value='Standard')
-                    with gr.Tab('Advanced Options', id='tab_advanced_options'):
+                with gr.Column():
+                    with gr.Accordion("Model Selection", open=True):
+                        model_family = gr.Dropdown(
+                            label="Shape Model",
+                            choices=ModelManager.get_family_choices(),
+                            value=model_mgr.shape_family,
+                            interactive=True,
+                        )
+                        speed_variant = gr.Dropdown(
+                            label="Speed Variant",
+                            choices=get_available_variants(model_mgr.shape_family),
+                            value=model_mgr.shape_variant,
+                            interactive=True,
+                        )
+                        tex_model = gr.Dropdown(
+                            label="Texture Model",
+                            choices=ModelManager.get_tex_choices(),
+                            value=model_mgr.tex_key,
+                            interactive=True,
+                            visible=HAS_TEXTUREGEN,
+                        )
+                        model_status = gr.Markdown(
+                            value=f"**Loaded:** {model_mgr.current_model_display}  \n**Texture:** {model_mgr.current_tex_display}"
+                        )
+                        with gr.Row():
+                            load_model_btn = gr.Button(value="Apply Model Change", variant="secondary", min_width=100)
+
+                    with gr.Accordion('Advanced Options', open=False):
+                        with gr.Row():
+                            decode_mode = gr.Radio(label='Decoding Mode',
+                                                   info='The resolution for exporting mesh from generated vectset',
+                                                   choices=['Low', 'Standard', 'High'],
+                                                   value='Standard')
                         with gr.Row():
                             check_box_rembg = gr.Checkbox(value=True, label='Remove Background', min_width=100)
                             randomize_seed = gr.Checkbox(label="Randomize seed", value=True, min_width=100)
@@ -450,14 +499,14 @@ def build_app():
                         with gr.Row():
                             num_steps = gr.Slider(maximum=100,
                                                   minimum=1,
-                                                  value=5 if 'turbo' in args.subfolder else 30,
+                                                  value=model_mgr.default_steps,
                                                   step=1, label='Inference Steps')
                             octree_resolution = gr.Slider(maximum=512, minimum=16, value=256, label='Octree Resolution')
                         with gr.Row():
                             cfg_scale = gr.Number(value=5.0, label='Guidance Scale', min_width=100)
                             num_chunks = gr.Slider(maximum=5000000, minimum=1000, value=8000,
                                                    label='Number of Chunks', min_width=100)
-                    with gr.Tab("Export", id='tab_export'):
+                    with gr.Accordion("Export", open=True):
                         with gr.Row():
                             file_type = gr.Dropdown(label='File Type', choices=SUPPORTED_FORMATS,
                                                     value='glb', min_width=100)
@@ -472,36 +521,43 @@ def build_app():
                                                             interactive=False, min_width=100)
 
             with gr.Column(scale=6):
-                with gr.Tabs(selected='gen_mesh_panel') as tabs_output:
-                    with gr.Tab('Generated Mesh', id='gen_mesh_panel'):
+                with gr.Column():
+                    with gr.Accordion('Generated Mesh', open=True):
                         html_gen_mesh = gr.HTML(HTML_OUTPUT_PLACEHOLDER, label='Output')
-                    with gr.Tab('Exporting Mesh', id='export_mesh_panel'):
+                    with gr.Accordion('Part Decomposition', open=False):
+                        gr.Markdown("Segment the generated mesh into semantic parts using P3-SAM, then generate completed parts with XPart.")
+                        with gr.Row():
+                            segment_btn = gr.Button(value="1. Segment Parts", variant="primary", min_width=100)
+                            generate_parts_btn = gr.Button(value="2. Generate Parts", variant="primary", min_width=100)
+                        part_status = gr.Markdown(value="Load a mesh first, then click **Segment**.")
+                        with gr.Row():
+                            part_segmented = gr.Model3D(clear_color=[0.0, 0.0, 0.0, 0.0], label="Segmented Mesh")
+                            part_generated = gr.Model3D(clear_color=[0.0, 0.0, 0.0, 0.0], label="Generated Parts")
+                        part_face_id = gr.File(label="Face IDs (.npy)", visible=False)
+                        # Hidden state to carry mesh path from shape gen to part pipeline
+                        part_mesh_state = gr.State(value=None)
+                    with gr.Accordion('Exporting Mesh', open=True):
                         html_export_mesh = gr.HTML(HTML_OUTPUT_PLACEHOLDER, label='Output')
-                    with gr.Tab('Mesh Statistic', id='stats_panel'):
+                    with gr.Accordion('Mesh Statistic', open=False):
                         stats = gr.Json({}, label='Mesh Stats')
 
-            with gr.Column(scale=3 if MV_MODE else 2):
-                with gr.Tabs(selected='tab_img_gallery') as gallery:
-                    with gr.Tab('Image to 3D Gallery', id='tab_img_gallery', visible=not MV_MODE) as tab_gi:
+            with gr.Column(scale=3 if model_mgr.is_mv_mode else 2):
+                with gr.Column():
+                    with gr.Accordion('Image to 3D Gallery', open=not model_mgr.is_mv_mode, visible=not model_mgr.is_mv_mode) as tab_gi:
                         with gr.Row():
                             gr.Examples(examples=example_is, inputs=[image],
                                         label=None, examples_per_page=18)
 
-                    with gr.Tab('Text to 3D Gallery', id='tab_txt_gallery', visible=HAS_T2I and not MV_MODE) as tab_gt:
+                    with gr.Accordion('Text to 3D Gallery', open=False, visible=HAS_T2I and not model_mgr.is_mv_mode) as tab_gt:
                         with gr.Row():
                             gr.Examples(examples=example_ts, inputs=[caption],
                                         label=None, examples_per_page=18)
-                    with gr.Tab('MultiView to 3D Gallery', id='tab_mv_gallery', visible=MV_MODE) as tab_mv:
+                    with gr.Accordion('MultiView to 3D Gallery', open=model_mgr.is_mv_mode, visible=model_mgr.is_mv_mode) as tab_mv_gallery:
                         with gr.Row():
                             gr.Examples(examples=example_mvs,
                                         inputs=[mv_image_front, mv_image_back, mv_image_left, mv_image_right],
                                         label=None, examples_per_page=6)
 
-        gr.HTML(f"""
-        <div align="center">
-        Activated Model - Shape Generation ({args.model_path}/{args.subfolder}) ; Texture Generation ({'Hunyuan3D-2' if HAS_TEXTUREGEN else 'Unavailable'})
-        </div>
-        """)
         if not HAS_TEXTUREGEN:
             gr.HTML("""
             <div style="margin-top: 5px;"  align="center">
@@ -517,10 +573,6 @@ def build_app():
                 Text to 3D is disable. To activate it, please run `python gradio_app.py --enable_t23d`.
             </div>
             """)
-
-        tab_ip.select(fn=lambda: gr.update(selected='tab_img_gallery'), outputs=gallery)
-        if HAS_T2I:
-            tab_tp.select(fn=lambda: gr.update(selected='tab_txt_gallery'), outputs=gallery)
 
         btn.click(
             shape_generation,
@@ -541,12 +593,10 @@ def build_app():
             ],
             outputs=[file_out, html_gen_mesh, stats, seed]
         ).then(
-            lambda: (gr.update(visible=False, value=False), gr.update(interactive=True), gr.update(interactive=True),
-                     gr.update(interactive=False)),
-            outputs=[export_texture, reduce_face, confirm_export, file_export],
-        ).then(
-            lambda: gr.update(selected='gen_mesh_panel'),
-            outputs=[tabs_output],
+            lambda p: (gr.update(visible=False, value=False), gr.update(interactive=True), gr.update(interactive=True),
+                     gr.update(interactive=False), p),
+            inputs=[file_out],
+            outputs=[export_texture, reduce_face, confirm_export, file_export, part_mesh_state],
         )
 
         btn_all.click(
@@ -568,23 +618,65 @@ def build_app():
             ],
             outputs=[file_out, file_out2, html_gen_mesh, stats, seed]
         ).then(
-            lambda: (gr.update(visible=True, value=True), gr.update(interactive=False), gr.update(interactive=True),
-                     gr.update(interactive=False)),
-            outputs=[export_texture, reduce_face, confirm_export, file_export],
-        ).then(
-            lambda: gr.update(selected='gen_mesh_panel'),
-            outputs=[tabs_output],
+            lambda p: (gr.update(visible=True, value=True), gr.update(interactive=False), gr.update(interactive=True),
+                     gr.update(interactive=False), p),
+            inputs=[file_out],
+            outputs=[export_texture, reduce_face, confirm_export, file_export, part_mesh_state],
         )
 
-        def on_gen_mode_change(value):
-            if value == 'Turbo':
-                return gr.update(value=5)
-            elif value == 'Fast':
-                return gr.update(value=10)
-            else:
-                return gr.update(value=30)
+        # ------------------------------------------------------------------
+        # Model selection event handlers
+        # ------------------------------------------------------------------
+        def on_model_family_change(family_key):
+            """Update speed variant choices when model family changes."""
+            variants = get_available_variants(family_key)
+            return gr.update(choices=variants, value=variants[0])
 
-        gen_mode.change(on_gen_mode_change, inputs=[gen_mode], outputs=[num_steps])
+        model_family.change(
+            on_model_family_change,
+            inputs=[model_family],
+            outputs=[speed_variant],
+        )
+
+        def on_speed_variant_change(family_key, variant_key):
+            """Load the selected shape model and update UI."""
+            info = model_mgr.load_shape_model(family_key, variant_key)
+
+            # Update model status text
+            status_text = f"**Loaded:** {info['model_display']}  \n**Texture:** {model_mgr.current_tex_display}"
+
+            return (
+                gr.update(value=info["default_steps"]),          # num_steps slider
+                gr.update(value=status_text),                    # model_status markdown
+                gr.update(visible=info["is_mv"]),                # tab_mv prompt accordion
+                gr.update(visible=not info["is_mv"]),            # tab_ip prompt accordion
+                gr.update(visible=HAS_T2I and not info["is_mv"]), # tab_tp prompt accordion
+                gr.update(visible=info["is_mv"]),                # tab_mv gallery accordion
+                gr.update(visible=not info["is_mv"]),            # tab_gi gallery accordion
+                gr.update(visible=HAS_T2I and not info["is_mv"]),# tab_gt gallery accordion
+            )
+
+        speed_variant.change(
+            on_speed_variant_change,
+            inputs=[model_family, speed_variant],
+            outputs=[
+                num_steps, model_status,
+                tab_mv, tab_ip, tab_tp,          # prompt accordions
+                tab_mv_gallery, tab_gi, tab_gt,   # gallery accordions
+            ],
+        )
+
+        def on_tex_model_change(tex_key):
+            """Load the selected texture model."""
+            model_mgr.load_tex_model(tex_key)
+            status_text = f"**Loaded:** {model_mgr.current_model_display}  \n**Texture:** {model_mgr.current_tex_display}"
+            return gr.update(value=status_text)
+
+        tex_model.change(
+            on_tex_model_change,
+            inputs=[tex_model],
+            outputs=[model_status],
+        )
 
         def on_decode_mode_change(value):
             if value == 'Low':
@@ -595,6 +687,118 @@ def build_app():
                 return gr.update(value=384)
 
         decode_mode.change(on_decode_mode_change, inputs=[decode_mode], outputs=[octree_resolution])
+
+        # ------------------------------------------------------------------
+        # Part Decomposition (P3-SAM + XPart) event handlers
+        # ------------------------------------------------------------------
+        _PARTSEG_AVAILABLE = False
+        try:
+            from hy3dgen.partseg import PartSegManager
+            _partseg_mgr = PartSegManager()
+            _PARTSEG_AVAILABLE = True
+        except Exception as e:
+            print(f"Part segmentation unavailable: {e}")
+
+        def on_segment_parts(mesh_path, seed):
+            """Run P3-SAM segmentation on the generated mesh."""
+            if mesh_path is None:
+                raise gr.Error("Please generate a mesh first (click Gen Shape or Gen Textured Shape).")
+            if not _PARTSEG_AVAILABLE:
+                raise gr.Error("Part segmentation is not available. Check dependencies (spconv, torch_scatter, etc.).")
+
+            # Move shape pipeline to CPU to free VRAM for P3-SAM
+            if model_mgr.shape_pipeline is not None:
+                model_mgr.shape_pipeline.to('cpu')
+            torch.cuda.empty_cache()
+
+            mesh = trimesh.load(mesh_path, force='mesh', process=False)
+            aabb, face_ids = _partseg_mgr.segment(mesh, seed=seed)
+
+            # Restore shape pipeline to GPU
+            if model_mgr.shape_pipeline is not None:
+                model_mgr.shape_pipeline.to('cuda')
+            torch.cuda.empty_cache()
+
+            # Color the mesh by part ID
+            import numpy as np
+            import pickle as _pickle
+            unique_ids = np.unique(face_ids)
+            color_map = {}
+            for i in unique_ids:
+                if i == -1:
+                    continue
+                part_color = np.random.RandomState(int(i)).randint(0, 255, 3)
+                color_map[i] = part_color
+            face_colors = []
+            for i in face_ids:
+                if i == -1:
+                    face_colors.append([0, 0, 0])
+                else:
+                    face_colors.append(color_map[i])
+            face_colors = np.array(face_colors).astype(np.uint8)
+            mesh_save = mesh.copy()
+            mesh_save.visual.face_colors = face_colors
+
+            save_folder = gen_save_folder()
+            segmented_path = os.path.join(save_folder, 'segmented.glb')
+            mesh_save.export(segmented_path)
+            face_id_path = os.path.join(save_folder, 'face_ids.npy')
+            np.save(face_id_path, face_ids)
+
+            # Store AABB and mesh_path in a pickle file (gr.State can't handle trimesh objects)
+            aabb_pkl_path = os.path.join(save_folder, 'aabb.pkl')
+            with open(aabb_pkl_path, 'wb') as f:
+                _pickle.dump({'aabb': aabb, 'mesh_path': mesh_path}, f)
+
+            # Only pass serializable paths through Gradio State
+            part_state = {'aabb_pkl': aabb_pkl_path, 'mesh_path': mesh_path}
+            return segmented_path, face_id_path, part_state, f"**Done!** Found {len(unique_ids) - (1 if -1 in unique_ids else 0)} parts."
+
+        def on_generate_parts(part_state, seed):
+            """Run XPart to generate completed parts."""
+            import pickle as _pickle
+            if part_state is None or not isinstance(part_state, dict) or 'aabb_pkl' not in part_state:
+                raise gr.Error("Please run 'Segment Parts' first.")
+            if not os.path.exists(part_state['aabb_pkl']):
+                raise gr.Error("Segmentation data no longer available. Please run 'Segment Parts' again.")
+
+            with open(part_state['aabb_pkl'], 'rb') as f:
+                saved = _pickle.load(f)
+            aabb = saved['aabb']
+            mesh_path = saved['mesh_path']
+
+            # Move shape pipeline to CPU to free VRAM for XPart
+            if model_mgr.shape_pipeline is not None:
+                model_mgr.shape_pipeline.to('cpu')
+            torch.cuda.empty_cache()
+
+            obj_mesh, bbox_mesh, explode_mesh = _partseg_mgr.generate_parts(
+                mesh_path, aabb, seed=seed
+            )
+
+            # Restore shape pipeline to GPU
+            if model_mgr.shape_pipeline is not None:
+                model_mgr.shape_pipeline.to('cuda')
+            torch.cuda.empty_cache()
+
+            save_folder = gen_save_folder()
+            parts_path = os.path.join(save_folder, 'parts.glb')
+            explode_path = os.path.join(save_folder, 'exploded.glb')
+            obj_mesh.export(parts_path)
+            explode_mesh.export(explode_path)
+
+            return parts_path, explode_path, f"**Done!** Parts generated."
+
+        segment_btn.click(
+            on_segment_parts,
+            inputs=[part_mesh_state, seed],
+            outputs=[part_segmented, part_face_id, part_mesh_state, part_status],
+        )
+        generate_parts_btn.click(
+            on_generate_parts,
+            inputs=[part_mesh_state, seed],
+            outputs=[part_generated, part_segmented, part_status],
+        )
 
         def on_export_click(file_out, file_out2, file_type, reduce_face, export_texture, target_face_num):
             if file_out is None:
@@ -614,10 +818,10 @@ def build_app():
                                                             textured=True)
             else:
                 mesh = trimesh.load(file_out)
-                mesh = floater_remove_worker(mesh)
-                mesh = degenerate_face_remove_worker(mesh)
+                mesh = model_mgr.floater_remover(mesh)
+                mesh = model_mgr.degenerate_face_remover(mesh)
                 if reduce_face:
-                    mesh = face_reduce_worker(mesh, target_face_num)
+                    mesh = model_mgr.face_reducer(mesh, target_face_num)
                 save_folder = gen_save_folder()
                 path = export_mesh(mesh, save_folder, textured=False, type=file_type)
 
@@ -630,9 +834,6 @@ def build_app():
             return model_viewer_html, gr.update(value=path, interactive=True)
 
         confirm_export.click(
-            lambda: gr.update(selected='export_mesh_panel'),
-            outputs=[tabs_output],
-        ).then(
             on_export_click,
             inputs=[file_out, file_out2, file_type, reduce_face, export_texture, target_face_num],
             outputs=[html_export_mesh, file_export]
@@ -664,10 +865,21 @@ if __name__ == '__main__':
     os.makedirs(SAVE_DIR, exist_ok=True)
 
     CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
-    MV_MODE = 'mv' in args.model_path
-    TURBO_MODE = 'turbo' in args.subfolder
 
-    HTML_HEIGHT = 690 if MV_MODE else 650
+    # ------------------------------------------------------------------
+    # Initialize ModelManager (replaces old MV_MODE, TURBO_MODE, workers)
+    # ------------------------------------------------------------------
+    model_mgr = ModelManager(
+        device=args.device,
+        cli_model_path=args.model_path,
+        cli_subfolder=args.subfolder,
+        cli_texgen_path=args.texgen_model_path,
+        enable_flashvdm_flag=args.enable_flashvdm,
+        mc_algo=args.mc_algo,
+        low_vram_mode=args.low_vram_mode,
+    )
+
+    HTML_HEIGHT = 690 if model_mgr.is_mv_mode else 650
     HTML_WIDTH = 500
     HTML_OUTPUT_PLACEHOLDER = f"""
     <div style='height: {650}px; width: 100%; border-radius: 8px; border-color: #e5e7eb; border-style: solid; border-width: 1px; display: flex; justify-content: center; align-items: center;'>
@@ -689,55 +901,41 @@ if __name__ == '__main__':
 
     SUPPORTED_FORMATS = ['glb', 'obj', 'ply', 'stl']
 
+    from hy3dgen.shapegen import FaceReducer, FloaterRemover, DegenerateFaceRemover, MeshSimplifier
+    from hy3dgen.shapegen.pipelines import export_to_trimesh
+    from hy3dgen.rembg import BackgroundRemover
+
+    # Load shape model via ModelManager
+    model_mgr.load_shape_model(model_mgr.shape_family, model_mgr.shape_variant)
+    if args.compile:
+        model_mgr.shape_pipeline.compile()
+
+    # Init post-process workers (stateless, no GPU VRAM concern)
+    model_mgr.floater_remover = FloaterRemover()
+    model_mgr.degenerate_face_remover = DegenerateFaceRemover()
+    model_mgr.face_reducer = FaceReducer()
+    model_mgr.rmbg_worker = BackgroundRemover()
+
+    # Texture generation (optional)
     HAS_TEXTUREGEN = False
     if not args.disable_tex:
         try:
-            from hy3dgen.texgen import Hunyuan3DPaintPipeline
-
-            texgen_worker = Hunyuan3DPaintPipeline.from_pretrained(args.texgen_model_path)
-            if args.low_vram_mode:
-                texgen_worker.enable_model_cpu_offload()
-            # Not help much, ignore for now.
-            # if args.compile:
-            #     texgen_worker.models['delight_model'].pipeline.unet.compile()
-            #     texgen_worker.models['delight_model'].pipeline.vae.compile()
-            #     texgen_worker.models['multiview_model'].pipeline.unet.compile()
-            #     texgen_worker.models['multiview_model'].pipeline.vae.compile()
-            HAS_TEXTUREGEN = True
+            model_mgr.load_tex_model(model_mgr.tex_key)
+            HAS_TEXTUREGEN = model_mgr.has_texgen
         except Exception as e:
             print(e)
             print("Failed to load texture generator.")
             print('Please try to install requirements by following README.md')
             HAS_TEXTUREGEN = False
 
+    # Text-to-image (optional)
     HAS_T2I = True
     if args.enable_t23d:
         from hy3dgen.text2image import HunyuanDiTPipeline
-
-        t2i_worker = HunyuanDiTPipeline('Tencent-Hunyuan/HunyuanDiT-v1.1-Diffusers-Distilled', device=args.device)
+        model_mgr.t2i_worker = HunyuanDiTPipeline(
+            'Tencent-Hunyuan/HunyuanDiT-v1.1-Diffusers-Distilled', device=args.device
+        )
         HAS_T2I = True
-
-    from hy3dgen.shapegen import FaceReducer, FloaterRemover, DegenerateFaceRemover, MeshSimplifier, \
-        Hunyuan3DDiTFlowMatchingPipeline
-    from hy3dgen.shapegen.pipelines import export_to_trimesh
-    from hy3dgen.rembg import BackgroundRemover
-
-    rmbg_worker = BackgroundRemover()
-    i23d_worker = Hunyuan3DDiTFlowMatchingPipeline.from_pretrained(
-        args.model_path,
-        subfolder=args.subfolder,
-        use_safetensors=True,
-        device=args.device,
-    )
-    if args.enable_flashvdm:
-        mc_algo = 'mc' if args.device in ['cpu', 'mps'] else args.mc_algo
-        i23d_worker.enable_flashvdm(mc_algo=mc_algo)
-    if args.compile:
-        i23d_worker.compile()
-
-    floater_remove_worker = FloaterRemover()
-    degenerate_face_remove_worker = DegenerateFaceRemover()
-    face_reduce_worker = FaceReducer()
 
     # https://discuss.huggingface.co/t/how-to-serve-an-html-file/33921/2
     # create a FastAPI app
@@ -748,7 +946,7 @@ if __name__ == '__main__':
     app.mount("/static", StaticFiles(directory=static_dir, html=True), name="static")
     shutil.copytree('./assets/env_maps', os.path.join(static_dir, 'env_maps'), dirs_exist_ok=True)
 
-    if args.low_vram_mode:
+    if model_mgr.low_vram_mode:
         torch.cuda.empty_cache()
     demo = build_app()
     app = gr.mount_gradio_app(app, demo, path="/")

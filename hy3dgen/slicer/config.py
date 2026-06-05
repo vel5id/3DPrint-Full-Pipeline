@@ -16,9 +16,7 @@
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
 import json
-import os
 
 
 # ---------------------------------------------------------------------------
@@ -187,12 +185,13 @@ def _load_profile_from_file(path: Path) -> PrinterProfile:
         data = json.load(fh)
 
     conn_data = data.get("connector", {})
+    defaults = ConnectorConfig()
     connector = ConnectorConfig(
-        pin_diameter=conn_data.get("pin_diameter", 4.5),
-        pin_depth=conn_data.get("pin_depth", 9.0),
-        pin_tolerance=conn_data.get("pin_tolerance", 0.2),
-        min_edge_distance=conn_data.get("min_edge_distance", 5.0),
-        min_pins_per_face=conn_data.get("min_pins_per_face", 2),
+        pin_diameter=conn_data.get("pin_diameter", defaults.pin_diameter),
+        pin_depth=conn_data.get("pin_depth", defaults.pin_depth),
+        pin_tolerance=conn_data.get("pin_tolerance", defaults.pin_tolerance),
+        min_edge_distance=conn_data.get("min_edge_distance", defaults.min_edge_distance),
+        min_pins_per_face=conn_data.get("min_pins_per_face", defaults.min_pins_per_face),
     )
 
     return PrinterProfile(
