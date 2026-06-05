@@ -307,13 +307,14 @@ class TestPinHoleGenerator:
     # -- pin placement --
 
     def test_place_pins_on_plane(self, gen):
-        """Place pins on a flat 20x20 mm face on XY plane."""
+        """Place pins on a flat 40x40 mm face on XY plane (large enough
+        for min_spacing=13.5 with 5mm edge margins)."""
         normal = np.array([0.0, 0.0, 1.0])
         face_verts = np.array([
-            [-10, -10, 0],
-            [10, -10, 0],
-            [10, 10, 0],
-            [-10, 10, 0],
+            [-20, -20, 0],
+            [20, -20, 0],
+            [20, 20, 0],
+            [-20, 20, 0],
         ], dtype=np.float64)
 
         positions = gen.place_pins(face_verts, normal)
@@ -363,6 +364,33 @@ class TestPinHoleGenerator:
         # Applying rotation to src should give dst
         result = mat[:3, :3] @ src
         assert np.allclose(result, dst, atol=1e-6)
+
+    def test_rotation_from_to_180_degrees(self):
+        src = np.array([0.0, 0.0, 1.0])
+        dst = np.array([0.0, 0.0, -1.0])
+        mat = PinHoleGenerator._rotation_from_to(src, dst)
+        # Applying rotation to src should give dst
+        result = mat[:3, :3] @ src
+        assert np.allclose(result, dst, atol=1e-6)
+        # Verify src was rotated to opposite direction
+        assert np.dot(src, result) == pytest.approx(-1.0, abs=1e-6)
+
+    # -- contact face detection --
+
+    def test_find_contact_face(self, gen):
+        """Two boxes with known closest points produce expected contact face."""
+        box_a = trimesh.creation.box(extents=[10, 10, 10])
+        box_b = trimesh.creation.box(extents=[10, 10, 10])
+        box_b.apply_translation([15, 0, 0])  # 5 mm gap
+        center, normal, face_verts = gen.find_contact_face(box_a, box_b)
+        # Returns tuple of 3 numpy arrays
+        assert isinstance(center, np.ndarray)
+        assert isinstance(normal, np.ndarray)
+        assert isinstance(face_verts, np.ndarray)
+        assert center.shape == (3,)
+        assert normal.shape == (3,)
+        assert face_verts.ndim == 2
+        assert face_verts.shape[1] == 3
 
     # -- full generate flow --
 

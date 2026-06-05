@@ -25,6 +25,7 @@ from typing import List, Optional, Tuple
 
 import numpy as np
 import trimesh
+from scipy.spatial.transform import Rotation
 
 from .config import ConnectorConfig
 from .cutter import PartInfo
@@ -117,12 +118,13 @@ class PinHoleGenerator:
         face_verts : (N, 3) np.ndarray
             Vertices of mesh A near the contact region.
         """
-        # Closest-point query
-        closest_a, closest_b, _dist = trimesh.proximity.closest_point(
-            mesh_a, mesh_b
+        # Closest-point query: find closest vertex pair between meshes
+        pts_on_a, dists, _ = trimesh.proximity.closest_point(
+            mesh_a, mesh_b.vertices
         )
-        closest_a = np.asarray(closest_a, dtype=np.float64)
-        closest_b = np.asarray(closest_b, dtype=np.float64)
+        min_idx = np.argmin(dists)
+        closest_a = np.asarray(pts_on_a[min_idx], dtype=np.float64)
+        closest_b = np.asarray(mesh_b.vertices[min_idx], dtype=np.float64)
 
         # Direction from A -> B
         direction = closest_b - closest_a
@@ -210,38 +212,40 @@ class PinHoleGenerator:
             )
             return [centroid_3d]
 
-        # --- Grid placement ---
-        n_pins = max(self.config.min_pins_per_face, 2)
+        # --- Grid placement with min_spacing enforcement ---
+        n_pins = self.config.min_pins_per_face
         width = float(max_uv[0] - min_uv[0])
         height = float(max_uv[1] - min_uv[1])
 
         if width <= 0 or height <= 0:
             return [centroid_3d]
 
-        aspect = width / max(height, 1e-6)
-        if aspect > 2.0:
-            n_x, n_y = n_pins, 1
-        elif aspect < 0.5:
-            n_x, n_y = 1, n_pins
-        else:
-            n_x = max(1, int(np.ceil(np.sqrt(float(n_pins)))))
-            n_y = max(1, int(np.ceil(float(n_pins) / n_x)))
+        min_spacing = self.config.min_spacing
+
+        # Find a grid (nx, ny) that respects min_spacing
+        grid_ok = False
+        for nx in range(1, n_pins + 1):
+            ny = max(1, int(np.ceil(n_pins / nx)))
+            if width / nx >= min_spacing and height / ny >= min_spacing:
+                n_x, n_y = nx, ny
+                grid_ok = True
+                break
+
+        if not grid_ok:
+            logger.info(
+                "Contact region too small for %d pins with min_spacing %.1f; "
+                "placing single pin at centroid",
+                n_pins, min_spacing,
+            )
+            return [centroid_3d]
 
         positions: List[np.ndarray] = []
         for ix in range(n_x):
             for iy in range(n_y):
                 if len(positions) >= n_pins:
                     break
-                uu = (
-                    (min_uv[0] + max_uv[0]) / 2.0
-                    if n_x == 1
-                    else min_uv[0] + (ix + 0.5) * width / n_x
-                )
-                vv = (
-                    (min_uv[1] + max_uv[1]) / 2.0
-                    if n_y == 1
-                    else min_uv[1] + (iy + 0.5) * height / n_y
-                )
+                uu = min_uv[0] + (ix + 0.5) * width / n_x
+                vv = min_uv[1] + (iy + 0.5) * height / n_y
                 pos_3d = centroid_3d + uu * u + vv * v
                 positions.append(pos_3d)
 
@@ -360,7 +364,6 @@ class PinHoleGenerator:
             else:
                 axis = np.cross(src, np.array([0.0, 1.0, 0.0]))
             axis = axis / (np.linalg.norm(axis) + 1e-10)
-            from scipy.spatial.transform import Rotation
             r = Rotation.from_rotvec(np.pi * axis)
             mat = np.eye(4)
             mat[:3, :3] = r.as_matrix()
@@ -406,13 +409,6 @@ class PinHoleGenerator:
         list[PartInfo]
             Parts with connectors applied (or originals on failure).
         """
-        pairs = self.find_adjacent_pairs(parts)
-        if not pairs:
-            logger.info(
-                "No adjacent pairs -- skipping connector generation"
-            )
-            return parts
-
         # Deep-copy parts so we don't mutate the caller's data
         result: List[PartInfo] = []
         for p in parts:
@@ -424,6 +420,13 @@ class PinHoleGenerator:
                 bbox_size=p.bbox_size.copy(),
                 fits_bed=p.fits_bed,
             ))
+
+        pairs = self.find_adjacent_pairs(parts)
+        if not pairs:
+            logger.info(
+                "No adjacent pairs -- skipping connector generation"
+            )
+            return result
 
         for i, j, _dist in pairs:
             part_a = result[i]
@@ -442,6 +445,9 @@ class PinHoleGenerator:
                         part_a.mesh = trimesh.boolean.union(
                             [part_a.mesh, pin]
                         )
+                        part_a.bbox_min = np.asarray(part_a.mesh.bounds[0], dtype=np.float64)
+                        part_a.bbox_max = np.asarray(part_a.mesh.bounds[1], dtype=np.float64)
+                        part_a.bbox_size = part_a.bbox_max - part_a.bbox_min
                     except Exception as exc:
                         logger.warning(
                             "Boolean union (pin) failed on '%s': %s. "
@@ -459,6 +465,9 @@ class PinHoleGenerator:
                         part_b.mesh = trimesh.boolean.difference(
                             [part_b.mesh, hole]
                         )
+                        part_b.bbox_min = np.asarray(part_b.mesh.bounds[0], dtype=np.float64)
+                        part_b.bbox_max = np.asarray(part_b.mesh.bounds[1], dtype=np.float64)
+                        part_b.bbox_size = part_b.bbox_max - part_b.bbox_min
                     except Exception as exc:
                         logger.warning(
                             "Boolean difference (hole) failed on "
