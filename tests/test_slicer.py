@@ -406,3 +406,71 @@ class TestPinHoleGenerator:
         assert len(result) == 2
         # Vertices should be unchanged (no connectors applied)
         assert np.allclose(result[0].mesh.vertices, box_a.vertices)
+
+
+# -----------------------------------------------------------------------
+# SlicerManager tests
+# -----------------------------------------------------------------------
+
+import tempfile
+import os
+from hy3dgen.slicer import SlicerManager
+
+
+class TestSlicerManager:
+    @pytest.fixture
+    def mgr(self):
+        return SlicerManager(QIDI_Q2_PROFILE)
+
+    @pytest.fixture
+    def two_part_scene(self):
+        """Two small boxes near each other."""
+        scene = trimesh.Scene()
+        box_a = trimesh.creation.box(extents=[50, 50, 50])
+        scene.add_geometry(box_a, geom_name="box_a")
+        box_b = trimesh.creation.box(extents=[50, 50, 50])
+        box_b.apply_translation([55, 0, 0])
+        scene.add_geometry(box_b, geom_name="box_b")
+        return scene
+
+    def test_process_returns_part_infos(self, mgr, two_part_scene):
+        result = mgr.process(two_part_scene, skip_connectors=True)
+        assert len(result) == 2
+        assert all(isinstance(p, PartInfo) for p in result)
+        assert result[0].name == "box_a"
+        assert result[1].name == "box_b"
+
+    def test_process_with_connectors(self, mgr, two_part_scene):
+        result = mgr.process(two_part_scene, skip_connectors=False)
+        assert len(result) == 2
+        # Both should still be valid trimesh objects
+        for p in result:
+            assert isinstance(p.mesh, trimesh.Trimesh)
+            assert len(p.mesh.vertices) > 0
+
+    def test_process_empty_scene(self, mgr):
+        scene = trimesh.Scene()
+        result = mgr.process(scene)
+        assert result == []
+
+    def test_export_stl_creates_files(self, mgr, two_part_scene):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            part_infos = mgr.cutter.process(two_part_scene)
+            saved = mgr.export_stl(part_infos, tmpdir)
+            assert len(saved) == 2
+            for p in saved:
+                assert os.path.isfile(p)
+                assert p.suffix == ".stl"
+            # README.txt should also exist
+            readme = os.path.join(tmpdir, "README.txt")
+            assert os.path.isfile(readme)
+
+    def test_export_stl_readme_content(self, mgr, two_part_scene):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            part_infos = mgr.cutter.process(two_part_scene)
+            mgr.export_stl(part_infos, tmpdir)
+            readme = os.path.join(tmpdir, "README.txt")
+            content = open(readme).read()
+            assert "box_a" in content
+            assert "box_b" in content
+            assert "Qidi Q2" in content
