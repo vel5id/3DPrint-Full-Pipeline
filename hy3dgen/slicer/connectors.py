@@ -27,8 +27,11 @@ import numpy as np
 import trimesh
 from scipy.spatial.transform import Rotation
 
+import gc
+
 from .config import ConnectorConfig
 from .cutter import PartInfo
+from .memory import log_memory_usage, free_gpu_memory, warn_if_large_mesh
 
 logger = logging.getLogger(__name__)
 
@@ -409,6 +412,9 @@ class PinHoleGenerator:
         list[PartInfo]
             Parts with connectors applied (or originals on failure).
         """
+        # ---- Enter memory snapshot ----
+        log_memory_usage(logger, "connectors/enter")
+
         # Deep-copy parts so we don't mutate the caller's data
         result: List[PartInfo] = []
         for p in parts:
@@ -436,23 +442,54 @@ class PinHoleGenerator:
                 center, normal, face_verts = self.find_contact_face(
                     part_a.mesh, part_b.mesh
                 )
+
+                # Log vertex/face counts
+                logger.info(
+                    "Processing pair '%s' (%d verts, %d faces) <-> "
+                    "'%s' (%d verts, %d faces)",
+                    part_a.name,
+                    len(part_a.mesh.vertices), len(part_a.mesh.faces),
+                    part_b.name,
+                    len(part_b.mesh.vertices), len(part_b.mesh.faces),
+                )
+
                 pin_positions = self.place_pins(face_verts, normal)
 
                 for pos in pin_positions:
                     # --- Pin on part A ---
                     pin = self.create_pin_mesh(pos, normal)
                     try:
+                        # Warn and GC before boolean on large meshes
+                        large_a = warn_if_large_mesh(
+                            part_a.mesh, logger, part_a.name
+                        )
+                        if (
+                            len(part_a.mesh.vertices) > 50000
+                            or large_a
+                        ):
+                            gc.collect()
+
                         part_a.mesh = trimesh.boolean.union(
                             [part_a.mesh, pin]
                         )
-                        part_a.bbox_min = np.asarray(part_a.mesh.bounds[0], dtype=np.float64)
-                        part_a.bbox_max = np.asarray(part_a.mesh.bounds[1], dtype=np.float64)
+                        part_a.bbox_min = np.asarray(
+                            part_a.mesh.bounds[0], dtype=np.float64
+                        )
+                        part_a.bbox_max = np.asarray(
+                            part_a.mesh.bounds[1], dtype=np.float64
+                        )
                         part_a.bbox_size = part_a.bbox_max - part_a.bbox_min
+                    except MemoryError as exc:
+                        logger.warning(
+                            "Out of memory during boolean union (pin) on "
+                            "'%s': %s. Keeping original mesh.",
+                            part_a.name, exc, exc_info=True,
+                        )
                     except Exception as exc:
                         logger.warning(
                             "Boolean union (pin) failed on '%s': %s. "
                             "Keeping original mesh.",
-                            part_a.name, exc,
+                            part_a.name, exc, exc_info=True,
                         )
 
                     # --- Hole on part B ---
@@ -462,17 +499,37 @@ class PinHoleGenerator:
                         hole_pos, -normal  # points INTO part B
                     )
                     try:
+                        # Warn and GC before boolean on large meshes
+                        large_b = warn_if_large_mesh(
+                            part_b.mesh, logger, part_b.name
+                        )
+                        if (
+                            len(part_b.mesh.vertices) > 50000
+                            or large_b
+                        ):
+                            gc.collect()
+
                         part_b.mesh = trimesh.boolean.difference(
                             [part_b.mesh, hole]
                         )
-                        part_b.bbox_min = np.asarray(part_b.mesh.bounds[0], dtype=np.float64)
-                        part_b.bbox_max = np.asarray(part_b.mesh.bounds[1], dtype=np.float64)
+                        part_b.bbox_min = np.asarray(
+                            part_b.mesh.bounds[0], dtype=np.float64
+                        )
+                        part_b.bbox_max = np.asarray(
+                            part_b.mesh.bounds[1], dtype=np.float64
+                        )
                         part_b.bbox_size = part_b.bbox_max - part_b.bbox_min
+                    except MemoryError as exc:
+                        logger.warning(
+                            "Out of memory during boolean difference "
+                            "(hole) on '%s': %s. Keeping original mesh.",
+                            part_b.name, exc, exc_info=True,
+                        )
                     except Exception as exc:
                         logger.warning(
                             "Boolean difference (hole) failed on "
                             "'%s': %s. Keeping original mesh.",
-                            part_b.name, exc,
+                            part_b.name, exc, exc_info=True,
                         )
 
                 logger.info(
@@ -480,11 +537,19 @@ class PinHoleGenerator:
                     len(pin_positions), part_a.name, part_b.name,
                 )
 
+            except MemoryError as exc:
+                logger.warning(
+                    "Out of memory generating connectors between '%s' and "
+                    "'%s': %s",
+                    part_a.name, part_b.name, exc, exc_info=True,
+                )
             except Exception as exc:
                 logger.warning(
                     "Failed to generate connectors between '%s' and "
                     "'%s': %s",
-                    part_a.name, part_b.name, exc,
+                    part_a.name, part_b.name, exc, exc_info=True,
                 )
 
+        # ---- Exit memory snapshot ----
+        log_memory_usage(logger, "connectors/exit")
         return result

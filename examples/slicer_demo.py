@@ -13,6 +13,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import gc
 import logging
 import sys
 from pathlib import Path
@@ -22,6 +23,21 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
 logger = logging.getLogger("slicer_demo")
+
+try:
+    import torch
+    _HAS_TORCH = True
+except ImportError:
+    _HAS_TORCH = False
+
+
+def _free_gpu_between_stages():
+    """Release GPU memory and run garbage collection between pipeline stages."""
+    gc.collect()
+    if _HAS_TORCH and torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        gc.collect()
+    logger.info("Memory cleaned up between stages")
 
 
 def main():
@@ -85,6 +101,10 @@ def main():
     logger.info("Post-processed: %d vertices, %d faces",
                 len(mesh.vertices), len(mesh.faces))
 
+    from hy3dgen.slicer.memory import log_memory_usage
+    log_memory_usage(logger, "after_shape_gen")
+    _free_gpu_between_stages()
+
     # ==================================================================
     # Step 2: Texture generation (optional)
     # ==================================================================
@@ -99,6 +119,9 @@ def main():
         logger.info("Texture applied")
     else:
         logger.info("=== Step 2: Skipped (--skip-texture) ===")
+
+    log_memory_usage(logger, "after_texture")
+    _free_gpu_between_stages()
 
     # Save intermediate mesh
     out_dir = Path(args.output)
@@ -118,6 +141,9 @@ def main():
     logger.info("Segmented into %d parts", len(aabb) if aabb is not None
                 else 0)
 
+    log_memory_usage(logger, "after_segmentation")
+    _free_gpu_between_stages()
+
     # ==================================================================
     # Step 4: Part completion (XPart)
     # ==================================================================
@@ -126,6 +152,9 @@ def main():
         str(tmp_glb), aabb, seed=args.seed
     )
     logger.info("Parts generated")
+
+    log_memory_usage(logger, "after_completion")
+    _free_gpu_between_stages()
 
     # Save exploded view for reference
     if exploded is not None:

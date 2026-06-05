@@ -41,6 +41,12 @@ from .config import (
 )
 from .cutter import MeshCutter, PartInfo
 from .connectors import PinHoleGenerator
+from .memory import (
+    log_memory_usage,
+    free_memory,
+    warn_if_large_mesh,
+    estimate_mesh_memory,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -69,6 +75,15 @@ class SlicerManager:
         self.profile = profile
         self.cutter = MeshCutter(profile)
         self.connector_gen = PinHoleGenerator(profile.connector)
+
+    @property
+    def gpu_available(self) -> bool:
+        """Return ``True`` if CUDA GPU is available."""
+        try:
+            import torch
+            return torch.cuda.is_available()
+        except ImportError:
+            return False
 
     # ------------------------------------------------------------------
     # Public API
@@ -99,8 +114,18 @@ class SlicerManager:
         list[PartInfo]
             Processed parts (meshes have connectors applied).
         """
+        # ---- Entry memory snapshot ----
+        log_memory_usage(logger, "slicer/entry")
+
         # ---- 1. Size check ----
-        part_infos = self.cutter.process(parts)
+        try:
+            part_infos = self.cutter.process(parts)
+        except Exception as exc:
+            logger.error(
+                "Cutter stage failed: %s", exc, exc_info=True
+            )
+            raise
+
         if not part_infos:
             logger.warning("No valid parts found in input scene")
             return []
@@ -112,6 +137,15 @@ class SlicerManager:
             self.profile.name,
             *self.profile.usable_bed,
         )
+
+        # Log mesh stats
+        total_verts = sum(len(p.mesh.vertices) for p in part_infos)
+        total_faces = sum(len(p.mesh.faces) for p in part_infos)
+        logger.info(
+            "Total mesh geometry: %d vertices, %d faces across %d part(s)",
+            total_verts, total_faces, len(part_infos),
+        )
+        log_memory_usage(logger, "slicer/after_cutter")
 
         oversized = [p for p in part_infos if not p.fits_bed]
         if oversized:
@@ -129,12 +163,29 @@ class SlicerManager:
 
         # ---- 2. Connectors ----
         if not skip_connectors:
-            part_infos = self.connector_gen.generate(part_infos)
+            log_memory_usage(logger, "slicer/before_connectors")
+            try:
+                part_infos = self.connector_gen.generate(part_infos)
+                log_memory_usage(logger, "slicer/after_connectors")
+            except MemoryError as exc:
+                logger.error(
+                    "Out of memory during connector generation: %s. "
+                    "Falling back to unmodified parts.",
+                    exc, exc_info=True,
+                )
+                # Continue with original part_infos
+            except Exception as exc:
+                logger.error(
+                    "Connector generation failed: %s", exc, exc_info=True
+                )
+                raise
 
         # ---- 3. Export ----
         if output_dir is not None:
+            log_memory_usage(logger, "slicer/before_export")
             self.export_stl(part_infos, output_dir)
 
+        log_memory_usage(logger, "slicer/complete")
         return part_infos
 
     # ------------------------------------------------------------------
@@ -171,8 +222,16 @@ class SlicerManager:
                 part.mesh.export(str(fpath))
                 saved.append(fpath.resolve())
                 logger.info("Exported %s", fpath)
+            except MemoryError as exc:
+                logger.error(
+                    "Out of memory exporting '%s': %s", fname, exc,
+                    exc_info=True,
+                )
             except Exception as exc:
-                logger.error("Failed to export '%s': %s", fname, exc)
+                logger.error(
+                    "Failed to export '%s': %s", fname, exc,
+                    exc_info=True,
+                )
 
         # Summary README
         self._write_summary(parts, out / "README.txt")

@@ -61,6 +61,7 @@ class PrinterProfile:
     bed_size: tuple   # (X, Y, Z) mm — full mechanical travel
     margin: float      # mm — edge clearance on all sides
     connector: ConnectorConfig
+    memory_limit_mb: float = 4096.0  # GPU memory limit in MB (default 4 GB)
 
     @property
     def usable_bed(self) -> tuple:
