@@ -121,7 +121,8 @@ class Conditioner(torch.nn.Module):
         if self.use_seg_feat:
             # TODO: batchsize must be One
             num_parts = part_surface_inbbox.shape[0]
-            with torch.autocast(device_type="cuda", dtype=torch.float32):
+            # Disable autocast — spconv doesn't support fp16/bf16
+            with torch.autocast(device_type="cuda", enabled=False):
                 # encode sonata feature
                 # with torch.cuda.amp.autocast(enabled=False):
                 with torch.no_grad():

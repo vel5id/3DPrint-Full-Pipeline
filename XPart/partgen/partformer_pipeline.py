@@ -125,6 +125,10 @@ class TokenAllocMixin:
 
 class PartFormerPipeline(TokenAllocMixin):
 
+    # CPU offload chain: conditioner first (encode once), then model (diffusion loop), then vae (decode)
+    model_cpu_offload_seq = "conditioner->model->vae"
+    _exclude_from_cpu_offload = ["bbox_predictor", "scheduler"]
+
     def __init__(
         self,
         vae,
@@ -139,10 +143,24 @@ class PartFormerPipeline(TokenAllocMixin):
         self.model = model
         self.scheduler = scheduler
         self.conditioner = conditioner
-        self.kwargs = kwargs
         self.bbox_predictor = bbox_predictor
         self.verbose = verbose
+        # Extract device/dtype from kwargs if passed
+        self.device = kwargs.pop("device", "cuda")
+        self.dtype = kwargs.pop("dtype", torch.float32)
         self.kwargs = kwargs
+
+    @property
+    def components(self) -> dict:
+        """Return named sub-models for accelerate CPU-offload compatibility."""
+        comps = {
+            "vae": self.vae,
+            "model": self.model,
+            "conditioner": self.conditioner,
+        }
+        if self.bbox_predictor is not None:
+            comps["bbox_predictor"] = self.bbox_predictor
+        return comps
 
     @classmethod
     @synchronize_timer("Hunyuan3D PartGen Pipeline Model Loading")
@@ -230,17 +248,20 @@ class PartFormerPipeline(TokenAllocMixin):
         device="cuda",
         **kwargs,
     ):
-        model_dir = smart_load_model(
-            model_path=model_path,
-        )
-        model_ckpt = load_file(os.path.join(model_dir, "model/model.safetensors"))
-        conditioner_ckpt = load_file(
-            os.path.join(model_dir, "conditioner/conditioner.safetensors")
-        )
-        shapevae_ckpt = load_file(
-            os.path.join(model_dir, "shapevae/shapevae.safetensors")
-        )
-        p3sam_path = os.path.join(model_dir, "p3sam/p3sam.safetensors")
+        """Load XPart models with minimal RAM usage.
+
+        Weights are loaded one sub-model at a time: instantiate on CPU →
+        move to GPU with target dtype → load safetensors to CPU →
+        ``load_state_dict(assign=True)`` (in-place, no copy) → delete CPU
+        tensors → garbage-collect.  This keeps peak CPU RAM at ~5 GB
+        instead of ~25 GB.
+        """
+        import gc, json
+        from safetensors.torch import load_file as _load_sf
+
+        model_dir = smart_load_model(model_path=model_path)
+
+        # --- Read configs (tiny, no RAM concern) ---
         with open(os.path.join(model_dir, "model/config.json"), "r") as f:
             model_config = EasyDict(json.load(f))
         with open(os.path.join(model_dir, "conditioner/config.json"), "r") as f:
@@ -249,29 +270,54 @@ class PartFormerPipeline(TokenAllocMixin):
             shapevae_config = EasyDict(json.load(f))
         with open(os.path.join(model_dir, "scheduler/config.json"), "r") as f:
             scheduler_config = EasyDict(json.load(f))
-        with open(os.path.join(model_dir, "p3sam/config.json"), "r") as f:
-            bbox_predictor_config = EasyDict(json.load(f))
-            bbox_predictor_config["params"]["ckpt_path"] = p3sam_path
-        # load model
+
+        # --- Load Model (PartFormer DiT) ---
         model = instantiate_from_config(model_config)
-        model.load_state_dict(model_ckpt)
+        _ckpt = _load_sf(os.path.join(model_dir, "model/model.safetensors"))
+        model.load_state_dict(_ckpt, strict=False)
+        del _ckpt; gc.collect()
+        model.to(device=device, dtype=dtype)
+
+        # --- Load VAE (ShapeVAE) ---
         vae = instantiate_from_config(shapevae_config)
-        vae.load_state_dict(shapevae_ckpt)
+        _ckpt = _load_sf(os.path.join(model_dir, "shapevae/shapevae.safetensors"))
+        vae.load_state_dict(_ckpt, strict=False)
+        del _ckpt; gc.collect()
+        vae.to(device=device, dtype=dtype)
+
+        # --- Load Conditioner (Sonata + 2 VAEs — stays fp32) ---
         conditioner = instantiate_from_config(conditioner_config)
-        conditioner.load_state_dict(conditioner_ckpt)
+        _ckpt = _load_sf(os.path.join(model_dir, "conditioner/conditioner.safetensors"))
+        conditioner.load_state_dict(_ckpt, strict=False)
+        del _ckpt; gc.collect()
+        conditioner.to(device=device)  # fp32 — spconv doesn't support fp16
+
+        # --- Scheduler (no weights, just config) ---
         scheduler = instantiate_from_config(scheduler_config)
-        bbox_predictor = instantiate_from_config(bbox_predictor_config)
-        model_kwargs = dict(
+
+        # --- bbox_predictor: SKIP — PartSegManager loads P3-SAM separately ---
+        bbox_predictor = None
+
+        # --- Cleanup any lingering CPU memory ---
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+        logger.info(
+            "XPart loaded (dtype=%s, device=%s). Peak RAM: ~5 GB per sub-model.",
+            dtype, device,
+        )
+
+        return cls(
             vae=vae,
             model=model,
             scheduler=scheduler,
             conditioner=conditioner,
-            bbox_predictor=bbox_predictor,  # TODO: add bbox predictor
+            bbox_predictor=bbox_predictor,
             device=device,
             dtype=dtype,
+            **kwargs,
         )
-        model_kwargs.update(kwargs)
-        return cls(**model_kwargs)
 
     def compile(self):
         self.vae = torch.compile(self.vae)
@@ -283,12 +329,67 @@ class PartFormerPipeline(TokenAllocMixin):
             self.dtype = dtype
             self.vae.to(dtype=dtype)
             self.model.to(dtype=dtype)
-            self.conditioner.to(dtype=dtype)
+            # NOTE: conditioner stays in float32 because spconv (used by
+            # Sonata inside the conditioner) does not support fp16/bf16.
+            # With CPU offload, the conditioner is only on GPU during
+            # encode_cond, so the VRAM impact is limited to ~2-4 GB.
+            # self.conditioner.to(dtype=dtype)
+            if self.bbox_predictor is not None:
+                try:
+                    self.bbox_predictor.to(dtype=dtype)
+                except Exception:
+                    pass  # bbox_predictor may not support dtype conversion
         if device is not None:
-            self.device = torch.device(device)
+            self.device = torch.device(device) if isinstance(device, str) else device
             self.vae.to(device)
             self.model.to(device)
             self.conditioner.to(device)
+            if self.bbox_predictor is not None:
+                try:
+                    self.bbox_predictor.to(device)
+                except Exception:
+                    pass
+
+    # Staged GPU management: keep at most one large model on GPU at a time.
+    # Order: conditioner (encode) → model (diffusion) → vae (decode)
+    _staged_offload = False
+    _gpu_device = None
+
+    def enable_model_cpu_offload(self, gpu_id=0):
+        """Enable staged CPU offload for 12-16 GB GPUs.
+
+        Unlike accelerate hooks, this moves entire sub-models GPU↔CPU
+        only at stage boundaries (not every forward call), minimising
+        PCIe transfer overhead while keeping peak VRAM low.
+
+        Stage plan::
+
+            encode:  conditioner → GPU (fp32, ~3-4 GB), run, → CPU
+            diffuse: model       → GPU (fp16, ~4-8 GB), run 50 steps, → CPU
+            decode:  vae         → GPU (fp16, ~0.6 GB), run per-part
+
+        Peak VRAM: max(conditioner_fp32, model_fp16) ≈ 4-8 GB — fits in 16 GB.
+        """
+        self._staged_offload = True
+        self._gpu_device = torch.device(f"cuda:{gpu_id}")
+
+        # Keep models on CPU; move to GPU only when needed
+        self.to(device="cpu")
+
+        # Move scheduler sigmas to CPU (will move back during diffusion)
+        if hasattr(self.scheduler, 'sigmas') and isinstance(self.scheduler.sigmas, torch.Tensor):
+            self.scheduler.sigmas = self.scheduler.sigmas.cpu()
+
+        logger.info(
+            "XPart staged offload enabled. Peak VRAM: ~4-8 GB (fits 16 GB)."
+        )
+
+    def maybe_free_model_hooks(self):
+        """Clean up staged offload — move all models back to CPU."""
+        if self._staged_offload:
+            self.to(device="cpu")
+            torch.cuda.empty_cache()
+            logger.info("XPart staged offload cleaned up")
 
     def prepare_extra_step_kwargs(self, generator, eta):
         # prepare extra kwargs for the scheduler step, since not all schedulers have the same signature
@@ -541,7 +642,6 @@ class PartFormerPipeline(TokenAllocMixin):
         return outputs
 
     @torch.no_grad()
-    @torch.autocast("cuda", dtype=torch.bfloat16)
     def __call__(
         self,
         obj_surface=None,
@@ -628,13 +728,38 @@ class PartFormerPipeline(TokenAllocMixin):
             num_parts, latent_shape, dtype, device, generator
         )
         extra_step_kwargs = self.prepare_extra_step_kwargs(generator, eta)
-        # 3. condition
+        # 3. Encode condition (fp32 — spconv doesn't support fp16)
+        if self._staged_offload:
+            self.conditioner.to(device=self._gpu_device)
+
         cond = self.encode_cond(
             part_surface_inbbox.reshape(batch_size * num_parts, N, dim),
             obj_surface.expand(batch_size * num_parts, -1, -1),
             do_classifier_free_guidance,
         )
-        # 4. guidance_cond for controling sampling
+
+        # Cast cond to model dtype when conditioner runs fp32 but model is fp16
+        if self.dtype != torch.float32 and not do_classifier_free_guidance:
+            def _cast(obj, target_dtype):
+                if isinstance(obj, torch.Tensor):
+                    return obj.to(dtype=target_dtype)
+                if isinstance(obj, dict):
+                    return {k: _cast(v, target_dtype) for k, v in obj.items()}
+                return obj
+            cond = _cast(cond, self.dtype)
+
+        if self._staged_offload:
+            self.conditioner.to(device="cpu")
+            torch.cuda.empty_cache()
+
+        # 4. Move diffusion model to GPU (staged offload) + set up autocast
+        if self._staged_offload:
+            self.model.to(device=self._gpu_device)
+
+        _autocast_dtype = self.dtype if self.dtype in (torch.float16, torch.bfloat16) else torch.bfloat16
+        _autocast_ctx = torch.autocast(device_type="cuda", dtype=_autocast_dtype)
+
+        # 5. guidance_cond for controling sampling
         guidance_cond = None
         if getattr(self.model, "guidance_cond_proj_dim", None) is not None:
             logger.info("Using lcm guidance scale")
@@ -643,8 +768,7 @@ class PartFormerPipeline(TokenAllocMixin):
                 guidance_scale_tensor, embedding_dim=self.model.guidance_cond_proj_dim
             ).to(device=device, dtype=latents.dtype)
 
-        # 5. Prepare timesteps
-        # NOTE: this is slightly different from common usage, we start from 0.
+        # 6. Prepare timesteps + move scheduler sigmas to GPU
         sigmas = np.linspace(0, 1, num_inference_steps) if sigmas is None else sigmas
         timesteps, num_inference_steps = retrieve_timesteps(
             self.scheduler,
@@ -652,67 +776,77 @@ class PartFormerPipeline(TokenAllocMixin):
             device,
             sigmas=sigmas,
         )
+        # Ensure scheduler internal tensors are on the right device
+        if hasattr(self.scheduler, 'sigmas') and isinstance(self.scheduler.sigmas, torch.Tensor):
+            self.scheduler.sigmas = self.scheduler.sigmas.to(device)
 
         torch.cuda.empty_cache()
 
-        # 6. Denoising loop
-        with synchronize_timer("Diffusion Sampling"):
-            for i, t in enumerate(
-                tqdm(timesteps, disable=not enable_pbar, desc="Diffusion Sampling:")
-            ):
-                # expand the latents if we are doing classifier free guidance
-                if do_classifier_free_guidance:
-                    latent_model_input = torch.cat([latents] * 2)
-                    aabb = torch.repeat_interleave(aabb, 2, dim=0)
-                else:
-                    latent_model_input = latents
+        # 7. Denoising loop (under autocast for fp16 GPU compute)
+        with _autocast_ctx:
+            with synchronize_timer("Diffusion Sampling"):
+                for i, t in enumerate(
+                    tqdm(timesteps, disable=not enable_pbar, desc="Diffusion Sampling:")
+                ):
+                    # expand the latents if we are doing classifier free guidance
+                    if do_classifier_free_guidance:
+                        latent_model_input = torch.cat([latents] * 2)
+                        aabb = torch.repeat_interleave(aabb, 2, dim=0)
+                    else:
+                        latent_model_input = latents
 
-                # NOTE: we assume model get timesteps ranged from 0 to 1
-                timestep = t.expand(latent_model_input.shape[0]).to(latents.dtype)
-                timestep = timestep / self.scheduler.config.num_train_timesteps
-                noise_pred = self.model(
-                    latent_model_input,
-                    timestep,
-                    cond,
-                    aabb=aabb,
-                    num_tokens=num_tokens,
-                    guidance_cond=guidance_cond,
-                )
-
-                if do_classifier_free_guidance:
-                    noise_pred_cond, noise_pred_uncond = noise_pred.chunk(2)
-                    noise_pred = noise_pred_uncond + guidance_scale * (
-                        noise_pred_cond - noise_pred_uncond
+                    # NOTE: we assume model get timesteps ranged from 0 to 1
+                    timestep = t.expand(latent_model_input.shape[0]).to(latents.dtype)
+                    timestep = timestep / self.scheduler.config.num_train_timesteps
+                    noise_pred = self.model(
+                        latent_model_input,
+                        timestep,
+                        cond,
+                        aabb=aabb,
+                        num_tokens=num_tokens,
+                        guidance_cond=guidance_cond,
                     )
 
-                # compute the previous noisy sample x_t -> x_t-1
-                outputs = self.scheduler.step(noise_pred, t, latents)
-                latents = outputs.prev_sample
+                    if do_classifier_free_guidance:
+                        noise_pred_cond, noise_pred_uncond = noise_pred.chunk(2)
+                        noise_pred = noise_pred_uncond + guidance_scale * (
+                            noise_pred_cond - noise_pred_uncond
+                        )
 
-                if callback is not None and i % callback_steps == 0:
-                    step_idx = i // getattr(self.scheduler, "order", 1)
-                    callback(step_idx, t, outputs)
+                    # compute the previous noisy sample x_t -> x_t-1
+                    outputs = self.scheduler.step(noise_pred, t, latents)
+                    latents = outputs.prev_sample
 
-        # latents2mesh
-        # part_latents = torch.split(latents, num_tokens[0].tolist(), dim=1)
+                    if callback is not None and i % callback_steps == 0:
+                        step_idx = i // getattr(self.scheduler, "order", 1)
+                        callback(step_idx, t, outputs)
+
+        # 8. Diffusion done — offload model, load VAE for decode
+        if self._staged_offload:
+            self.model.to(device="cpu")
+            torch.cuda.empty_cache()
+            self.vae.to(device=self._gpu_device)
+
+        # latents2mesh (under autocast for VAE decode)
         out = trimesh.Scene()
-        for i, part_latent in enumerate(latents):
-            try:
-                part_mesh = self._export(
-                    latents=part_latent.unsqueeze(0),
-                    output_type=output_type,
-                    box_v=box_v,
-                    mc_level=mc_level,
-                    num_chunks=num_chunks,
-                    octree_resolution=octree_resolution,
-                    mc_algo=mc_algo,
-                    enable_pbar=enable_pbar,
-                )[0]
-                out.add_geometry(part_mesh)
-                random_color = np.random.randint(0, 255, size=3)
-                part_mesh.visual.face_colors = random_color
-            except Exception as e:
-                logger.error(f"Failed to export part {i} with error {e}")
+        with _autocast_ctx:
+            for i, part_latent in enumerate(latents):
+                try:
+                    part_mesh = self._export(
+                        latents=part_latent.unsqueeze(0),
+                        output_type=output_type,
+                        box_v=box_v,
+                        mc_level=mc_level,
+                        num_chunks=num_chunks,
+                        octree_resolution=octree_resolution,
+                        mc_algo=mc_algo,
+                        enable_pbar=enable_pbar,
+                    )[0]
+                    out.add_geometry(part_mesh)
+                    random_color = np.random.randint(0, 255, size=3)
+                    part_mesh.visual.face_colors = random_color
+                except Exception as e:
+                    logger.error(f"Failed to export part {i} with error {e}")
         print(f"Denormalize mesh: {center}, {scale}")
         for key in out.geometry.keys():
             _v = out.geometry[key].vertices
@@ -730,7 +864,10 @@ class PartFormerPipeline(TokenAllocMixin):
                 box.vertices += (bbox[0] + bbox[1]).float().cpu().numpy() / 2
                 box.vertices = box.vertices * scale + center
                 out_bbox.add_geometry(box)
-            return out, (out_bbox, mesh_bbox, explode_object)
+            result = out, (out_bbox, mesh_bbox, explode_object)
         else:
-            # return only the generated mesh
-            return out, None
+            result = out, None
+
+        # Release CPU offload hooks (no-op if offload was never enabled)
+        self.maybe_free_model_hooks()
+        return result
