@@ -1,0 +1,198 @@
+/* === Dark Industrial (default) === */
+:root,
+[data-theme="dark"] {
+  /* Backgrounds */
+  --bg-primary: #0d1117;
+  --bg-secondary: #161b22;
+  --bg-tertiary: #21262d;
+  --bg-hover: #292e36;
+
+  /* Borders */
+  --border-primary: #30363d;
+  --border-subtle: #21262d;
+
+  /* Text */
+  --text-primary: #c9d1d9;
+  --text-secondary: #8b949e;
+  --text-muted: #484f58;
+  --text-inverse: #0d1117;
+
+  /* Accent (green neon) */
+  --accent: #7ee787;
+  --accent-hover: #56d364;
+  --accent-muted: rgba(126, 231, 135, 0.15);
+  --accent-glow: rgba(126, 231, 135, 0.25);
+
+  /* Semantic */
+  --danger: #f85149;
+  --danger-hover: #ff6b63;
+  --danger-muted: rgba(248, 81, 73, 0.15);
+  --warning: #d29922;
+  --warning-hover: #e3b341;
+  --warning-muted: rgba(210, 153, 34, 0.15);
+  --success: #3fb950;
+
+  /* Buttons */
+  --btn-primary-bg: #238636;
+  --btn-primary-hover: #2ea043;
+  --btn-primary-text: #ffffff;
+  --btn-secondary-border: #30363d;
+  --btn-secondary-text: #c9d1d9;
+  --btn-secondary-hover-bg: #21262d;
+
+  /* Inputs */
+  --input-bg: #0d1117;
+  --input-border: #30363d;
+  --input-focus-border: #7ee787;
+  --input-focus-ring: rgba(126, 231, 135, 0.2);
+  --input-text: #c9d1d9;
+  --input-placeholder: #484f58;
+
+  /* Surfaces */
+  --surface-elevated: #1c2129;
+  --surface-overlay: rgba(0, 0, 0, 0.7);
+  --surface-tooltip: #21262d;
+
+  /* Spacing */
+  --space-xs: 4px;
+  --space-sm: 8px;
+  --space-md: 12px;
+  --space-lg: 16px;
+  --space-xl: 24px;
+
+  /* Typography */
+  --font-sans: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  --font-mono: 'SF Mono', 'Cascadia Code', 'Fira Code', monospace;
+  --font-size-xs: 11px;
+  --font-size-sm: 12px;
+  --font-size-md: 13px;
+  --font-size-lg: 15px;
+  --font-size-xl: 18px;
+  --font-size-2xl: 22px;
+
+  /* Radii */
+  --radius-sm: 2px;
+  --radius-md: 4px;
+  --radius-lg: 8px;
+
+  /* Shadows */
+  --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.4);
+  --shadow-md: 0 4px 12px rgba(0, 0, 0, 0.5);
+  --shadow-lg: 0 8px 24px rgba(0, 0, 0, 0.6);
+
+  /* Transitions */
+  --transition-fast: 0.15s ease;
+  --transition-base: 0.2s ease;
+  --transition-slow: 0.3s ease;
+
+  /* Sidebar */
+  --sidebar-width: 300px;
+
+  /* Scrollbar */
+  --scrollbar-track: transparent;
+  --scrollbar-thumb: #30363d;
+  --scrollbar-thumb-hover: #484f58;
+}
+
+/* === Clean Minimal (light) === */
+[data-theme="light"] {
+  --bg-primary: #ffffff;
+  --bg-secondary: #fafafa;
+  --bg-tertiary: #f3f4f6;
+  --bg-hover: #e5e7eb;
+
+  --border-primary: #e5e7eb;
+  --border-subtle: #f0f0f0;
+
+  --text-primary: #111827;
+  --text-secondary: #6b7280;
+  --text-muted: #9ca3af;
+  --text-inverse: #ffffff;
+
+  --accent: #111827;
+  --accent-hover: #374151;
+  --accent-muted: rgba(17, 24, 39, 0.08);
+  --accent-glow: rgba(17, 24, 39, 0.12);
+
+  --danger: #ef4444;
+  --danger-hover: #dc2626;
+  --danger-muted: rgba(239, 68, 68, 0.08);
+  --warning: #f59e0b;
+  --warning-hover: #d97706;
+  --warning-muted: rgba(245, 158, 11, 0.08);
+  --success: #059669;
+
+  --btn-primary-bg: #111827;
+  --btn-primary-hover: #1f2937;
+  --btn-primary-text: #ffffff;
+  --btn-secondary-border: #e5e7eb;
+  --btn-secondary-text: #374151;
+  --btn-secondary-hover-bg: #f3f4f6;
+
+  --input-bg: #ffffff;
+  --input-border: #d1d5db;
+  --input-focus-border: #111827;
+  --input-focus-ring: rgba(17, 24, 39, 0.15);
+  --input-text: #111827;
+  --input-placeholder: #9ca3af;
+
+  --surface-elevated: #ffffff;
+  --surface-overlay: rgba(0, 0, 0, 0.4);
+  --surface-tooltip: #1f2937;
+
+  --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.05);
+  --shadow-md: 0 4px 12px rgba(0, 0, 0, 0.08);
+  --shadow-lg: 0 8px 24px rgba(0, 0, 0, 0.12);
+
+  --radius-md: 6px;
+  --radius-lg: 10px;
+
+  --scrollbar-track: #fafafa;
+  --scrollbar-thumb: #d1d5db;
+  --scrollbar-thumb-hover: #9ca3af;
+}
+
+/* === Global Resets === */
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+html {
+  font-size: 14px;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+body {
+  font-family: var(--font-sans);
+  background: var(--bg-primary);
+  color: var(--text-primary);
+  line-height: 1.5;
+  overflow: hidden;
+  height: 100vh;
+  transition: background-color var(--transition-base), color var(--transition-base);
+}
+
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+::-webkit-scrollbar-track {
+  background: var(--scrollbar-track);
+}
+::-webkit-scrollbar-thumb {
+  background: var(--scrollbar-thumb);
+  border-radius: 3px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: var(--scrollbar-thumb-hover);
+}
+
+::selection {
+  background: var(--accent-muted);
+  color: var(--accent);
+}

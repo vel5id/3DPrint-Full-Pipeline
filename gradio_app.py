@@ -261,6 +261,12 @@ def _gen_shape(
         mesh = export_to_trimesh(outputs)[0]
         time_meta['export to trimesh'] = time.time() - tmp_start
 
+    if mesh is None:
+        raise RuntimeError(
+            "Surface extraction failed: the model was unable to generate a valid 3D surface from this image. "
+            "Try a different image, increase num_inference_steps (e.g. 10-20), or change the seed."
+        )
+
     stats['number_of_faces'] = mesh.faces.shape[0]
     stats['number_of_vertices'] = mesh.vertices.shape[0]
 

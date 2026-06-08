@@ -1,0 +1,366 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Hunyuan3D-2 — 3D Asset Generation</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="css/themes.css">
+  <link rel="stylesheet" href="css/app.css">
+  <script type="module" src="https://ajax.googleapis.com/ajax/libs/model-viewer/4.0.0/model-viewer.min.js"></script>
+</head>
+<body>
+  <div id="app">
+    <!-- Sidebar -->
+    <aside id="sidebar">
+      <div id="sidebar-header">
+        <div class="logo">
+          <span class="logo-icon">&#x2B21;</span>
+          <span class="logo-text">Hunyuan3D</span>
+          <span class="logo-version">v2.0</span>
+        </div>
+        <button id="theme-toggle" class="icon-btn" title="Toggle theme" aria-label="Toggle theme">
+          <span class="icon-dark">&#x263E;</span>
+          <span class="icon-light">&#x2600;</span>
+        </button>
+      </div>
+
+      <nav id="tab-bar">
+        <button class="tab active" data-tab="generate">Generate</button>
+        <button class="tab" data-tab="texture" disabled>Texture</button>
+        <button class="tab" data-tab="parts" disabled>Parts</button>
+        <button class="tab" data-tab="export">Export</button>
+      </nav>
+
+      <div id="tab-content">
+        <!-- Generate Panel -->
+        <div class="tab-panel active" data-panel="generate">
+          <div id="upload-zone" class="upload-zone">
+            <div class="upload-placeholder">
+              <span class="upload-icon">&#x2B06;</span>
+              <p class="upload-text">Drop image or click to browse</p>
+              <p class="upload-hint">PNG, JPG, WEBP — max 10 MB</p>
+            </div>
+            <img id="upload-preview" class="upload-preview hidden" alt="Preview">
+            <button id="upload-clear" class="upload-clear hidden" title="Clear image">&times;</button>
+            <input type="file" id="upload-input" accept="image/*" hidden>
+          </div>
+
+          <div id="presets-row" class="presets-row">
+            <button class="preset-btn" data-preset="fast">Fast</button>
+            <button class="preset-btn active" data-preset="balanced">Balanced</button>
+            <button class="preset-btn" data-preset="quality">Quality</button>
+          </div>
+
+          <div id="params-compact" class="params-section">
+            <div class="param-row">
+              <label class="param-label">Steps</label>
+              <div class="param-slider-wrapper">
+                <input type="range" id="param-steps" class="param-slider" min="1" max="100" value="15">
+              </div>
+              <span class="param-value" id="param-steps-value">15</span>
+            </div>
+            <div class="param-row">
+              <label class="param-label">Seed</label>
+              <div class="param-seed-row">
+                <input type="number" id="param-seed" class="param-seed-input" disabled placeholder="Random">
+                <label class="param-check">
+                  <input type="checkbox" id="param-random-seed" checked> Random
+                </label>
+              </div>
+            </div>
+            <label class="param-check param-check-standalone">
+              <input type="checkbox" id="param-remove-bg" checked> Remove background
+            </label>
+            <button id="toggle-advanced" class="text-btn">Advanced &#x25B8;</button>
+          </div>
+
+          <div id="params-advanced" class="params-section hidden">
+            <div class="param-row">
+              <label class="param-label">Guidance</label>
+              <div class="param-slider-wrapper">
+                <input type="range" id="param-guidance" class="param-slider" min="1" max="20" step="0.5" value="5">
+              </div>
+              <span class="param-value" id="param-guidance-value">5.0</span>
+            </div>
+            <div class="param-row">
+              <label class="param-label">Octree</label>
+              <div class="param-slider-wrapper">
+                <input type="range" id="param-octree" class="param-slider" min="16" max="512" value="256">
+              </div>
+              <span class="param-value" id="param-octree-value">256</span>
+            </div>
+            <div class="param-row">
+              <label class="param-label">Chunks</label>
+              <div class="param-slider-wrapper">
+                <input type="range" id="param-chunks" class="param-slider" min="1000" max="5000000" step="1000" value="8000">
+              </div>
+              <span class="param-value" id="param-chunks-value">8K</span>
+            </div>
+            <button id="toggle-advanced-collapse" class="text-btn">&#x25B2; Compact</button>
+
+            <!-- Scene Settings (visible when mesh loaded) -->
+            <div id="scene-settings" class="params-section hidden">
+              <div class="section-label">Scene</div>
+              <div class="param-row">
+                <label class="param-label">Exposure</label>
+                <div class="param-slider-wrapper">
+                  <input type="range" id="scene-exposure" class="param-slider" min="0.2" max="4" step="0.1" value="1.5">
+                </div>
+                <span class="param-value" id="scene-exposure-value">1.5</span>
+              </div>
+              <div class="param-row">
+                <label class="param-label">Shadow</label>
+                <div class="param-slider-wrapper">
+                  <input type="range" id="scene-shadow" class="param-slider" min="0" max="2" step="0.05" value="0.5">
+                </div>
+                <span class="param-value" id="scene-shadow-value">0.50</span>
+              </div>
+              <div class="param-row">
+                <label class="param-label">Softness</label>
+                <div class="param-slider-wrapper">
+                  <input type="range" id="scene-softness" class="param-slider" min="0" max="1" step="0.05" value="0.4">
+                </div>
+                <span class="param-value" id="scene-softness-value">0.40</span>
+              </div>
+              <div class="param-row">
+                <label class="param-label">Env Rotation</label>
+                <div class="param-slider-wrapper">
+                  <input type="range" id="scene-env-rot" class="param-slider" min="0" max="360" step="1" value="0">
+                </div>
+                <span class="param-value" id="scene-env-rot-value">0°</span>
+              </div>
+              <div class="param-row">
+                <label class="param-label">Wireframe</label>
+                <label class="param-check">
+                  <input type="checkbox" id="scene-wireframe"> Show
+                </label>
+              </div>
+              <button id="btn-reset-camera" class="btn btn-sm" style="margin-top:4px">Reset Camera</button>
+            </div>
+
+            <!-- Light Sources -->
+            <div id="lighting-settings" class="params-section hidden">
+              <div class="section-label">Light Sources</div>
+              <div class="param-row">
+                <label class="param-label">Count</label>
+                <select id="light-count" class="param-select" style="width:100%">
+                  <option value="1">1 light</option>
+                  <option value="2" selected>2 lights</option>
+                  <option value="3">3 lights</option>
+                  <option value="4">4 lights</option>
+                </select>
+              </div>
+              <div class="param-row">
+                <label class="param-label">Position</label>
+                <select id="light-preset" class="param-select" style="width:100%">
+                  <option value="front">Front</option>
+                  <option value="lr" selected>Left / Right</option>
+                  <option value="triangle">Triangle</option>
+                  <option value="quad">4-Sided</option>
+                </select>
+              </div>
+              <div class="param-row">
+                <label class="param-label">Color</label>
+                <input type="color" id="light-color" value="#ffcc88" style="width:100%;height:28px;border:none;border-radius:var(--radius-sm);cursor:pointer;background:var(--input-bg);padding:2px 4px">
+              </div>
+              <div class="param-row">
+                <label class="param-label">Intensity</label>
+                <div class="param-slider-wrapper">
+                  <input type="range" id="light-intensity" class="param-slider" min="0.5" max="12" step="0.1" value="4">
+                </div>
+                <span class="param-value" id="light-intensity-value">4.0</span>
+              </div>
+              <div class="param-row">
+                <label class="param-label">Distance</label>
+                <div class="param-slider-wrapper">
+                  <input type="range" id="light-distance" class="param-slider" min="1" max="12" step="0.1" value="3.5">
+                </div>
+                <span class="param-value" id="light-distance-value">3.5u</span>
+              </div>
+            </div>
+          </div>
+
+          <div class="section-label">Model</div>
+          <div id="model-select-area"></div>
+
+          <div class="action-buttons">
+            <button id="btn-generate-shape" class="btn btn-primary">Generate Mesh</button>
+            <button id="btn-generate-textured" class="btn btn-secondary">Generate + Texture</button>
+          </div>
+        </div>
+
+        <!-- Texture Panel -->
+        <div class="tab-panel" data-panel="texture">
+          <div class="parts-section">
+            <p class="parts-hint">Apply a texture to the currently loaded mesh.</p>
+            <button id="btn-apply-texture" class="btn btn-primary" disabled>Apply Texture</button>
+            <div class="parts-actions">
+              <button id="btn-download-textured" class="btn btn-secondary hidden" disabled>Download Textured Mesh</button>
+            </div>
+          </div>
+        </div>
+
+        <!-- Parts Panel -->
+        <div class="tab-panel" data-panel="parts">
+          <div class="parts-section">
+            <div class="parts-flow">
+              <div class="parts-step">
+                <span class="parts-step-num">1</span>
+                <span class="parts-step-label">Segment</span>
+                <button id="btn-segment-parts" class="btn btn-secondary" disabled>Segment Mesh</button>
+              </div>
+              <div class="parts-step">
+                <span class="parts-step-num">2</span>
+                <span class="parts-step-label">Generate</span>
+                <button id="btn-generate-parts" class="btn btn-secondary" disabled>Generate Parts</button>
+              </div>
+              <div class="parts-step">
+                <span class="parts-step-num">3</span>
+                <span class="parts-step-label">Print</span>
+                <button id="btn-prepare-print" class="btn btn-primary" disabled>Prepare for Print</button>
+              </div>
+            </div>
+            <div id="parts-status" class="parts-status hidden">
+              <span id="parts-state-label">--</span>
+            </div>
+          </div>
+        </div>
+
+        <!-- Export Panel -->
+        <div class="tab-panel" data-panel="export">
+          <div id="export-section" class="params-section">
+            <div class="param-row">
+              <label class="param-label">Format</label>
+              <select id="export-format" class="param-select">
+                <option value="glb">GLB</option>
+                <option value="obj">OBJ</option>
+                <option value="stl">STL</option>
+                <option value="ply">PLY</option>
+              </select>
+            </div>
+            <div class="param-row">
+              <label class="param-label">Simplify</label>
+              <div class="param-check-row">
+                <input type="checkbox" id="export-simplify">
+                <input type="number" id="export-face-count" class="param-num-input" value="10000" disabled>
+                <span class="param-unit">faces</span>
+              </div>
+            </div>
+            <button id="btn-export" class="btn btn-primary">Download</button>
+          </div>
+        </div>
+      </div>
+
+      <div id="sidebar-footer">
+        <div id="model-status-line">
+          <span class="status-dot"></span>
+          <span id="model-display-name">2mini Turbo</span>
+        </div>
+      </div>
+    </aside>
+
+    <!-- Main Viewer Area -->
+    <main id="viewer-area">
+      <div id="viewer-container">
+        <div id="viewer-empty" class="viewer-state visible">
+          <div class="empty-state">
+            <div class="empty-icon">&#x25A3;</div>
+            <p class="empty-title">No mesh loaded</p>
+            <p class="empty-subtitle">Drop an image in the sidebar to start</p>
+          </div>
+        </div>
+
+        <div id="viewer-loading" class="viewer-state">
+          <div class="loading-state">
+            <div class="spinner"></div>
+            <p class="loading-phase" id="loading-phase-text">Initializing...</p>
+            <div class="progress-bar-wrapper">
+              <div class="progress-bar">
+                <div class="progress-fill" id="loading-progress-fill"></div>
+              </div>
+              <span class="progress-percent" id="loading-progress-text">0%</span>
+            </div>
+          </div>
+        </div>
+
+        <model-viewer
+          id="model-viewer-3d"
+          class="viewer-state viewer-3d"
+          camera-controls
+          touch-action="pan-y"
+          camera-target="auto auto auto"
+          bounds="tight"
+          min-camera-orbit="0.5m"
+          max-camera-orbit="infinity"
+          interpolation-decay="200"
+          interaction-prompt="none"
+          exposure="1.5"
+          shadow-intensity="0.5"
+          shadow-softness="0.4"
+          tone-mapping="aces"
+        ></model-viewer>
+
+        <div id="viewer-toolbar" class="viewer-toolbar hidden">
+          <div class="viewer-toolbar-group">
+            <button class="toolbar-btn active" data-mode="solid" title="Solid">&#x25A0;</button>
+            <button class="toolbar-btn" data-mode="wireframe" title="Wireframe">&#x25A1;</button>
+            <button class="toolbar-btn" data-mode="matcap" title="MatCap">&#x25D4;</button>
+          </div>
+          <div class="viewer-toolbar-group">
+            <button class="toolbar-btn" id="viewer-reset" title="Reset camera">&#x21BA;</button>
+            <button class="toolbar-btn" id="viewer-fullscreen" title="Fullscreen">&#x26F6;</button>
+          </div>
+        </div>
+      </div>
+
+      <div id="status-bar">
+        <div class="status-left">
+          <span id="status-gpu-indicator" class="status-gpu-indicator idle"></span>
+          <span id="status-gpu-text">GPU idle</span>
+        </div>
+        <div class="status-center">
+          <span id="status-model-name">2mini Turbo</span>
+          <span class="status-separator">|</span>
+          <span id="status-vram">VRAM --</span>
+          <span class="status-separator">|</span>
+          <span id="status-mesh-info">No mesh</span>
+        </div>
+        <div class="status-right">
+          <span id="status-ws-indicator" class="status-ws-indicator"></span>
+          <span id="status-time">--</span>
+        </div>
+      </div>
+    </main>
+  </div>
+
+  <div id="modal-overlay" class="modal-overlay hidden">
+    <div class="modal-box" id="modal-box">
+      <div class="modal-header">
+        <h3 id="modal-title"></h3>
+        <button class="modal-close" id="modal-close">&times;</button>
+      </div>
+      <div class="modal-body" id="modal-body"></div>
+      <div class="modal-footer" id="modal-footer"></div>
+    </div>
+  </div>
+
+  <script src="js/state.js"></script>
+  <script src="js/api.js"></script>
+  <script src="js/components/theme.js"></script>
+  <script src="js/components/tabs.js"></script>
+  <script src="js/components/upload.js"></script>
+  <script src="js/components/presets.js"></script>
+  <script src="js/components/params.js"></script>
+  <script src="js/components/model-select.js"></script>
+  <script src="js/components/viewer.js"></script>
+  <script src="js/components/progress.js"></script>
+  <script src="js/components/scene-settings.js"></script>
+  <script src="js/components/lighting.js"></script>
+  <script src="js/components/statusbar.js"></script>
+  <script src="js/components/modal.js"></script>
+  <script src="js/app.js"></script>
+</body>
+</html>
