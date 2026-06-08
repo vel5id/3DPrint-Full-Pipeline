@@ -428,18 +428,34 @@ def build_app():
     with gr.Blocks(theme=gr.themes.Base(), title='Hunyuan-3D-2.0', analytics_enabled=False, css=custom_css) as demo:
         gr.HTML(title_html)
 
+        # -- notice: SPA is the recommended interface --
+        gr.HTML("""
+        <div style="text-align:center;padding:8px 0;border-bottom:1px solid #30363d;margin-bottom:8px">
+          <b>⚡ Single-image generation → <a href=\"http://127.0.0.1:8081\" target=\"_blank\">SPA on port 8081</a></b>
+          &nbsp;(model selection, scene/lighting controls, parts, export)
+        </div>
+        """)
+
+        # -- default params (set via SPA; hardcoded here for multiview / t23d) --
+        default_steps = gr.State(value=model_mgr.default_steps)
+        default_guidance = gr.State(value=5.0)
+        default_seed = gr.State(value=42)
+        default_octree_res = gr.State(value=256)
+        default_num_chunks = gr.State(value=8000)
+        default_remove_bg = gr.State(value=True)
+
         with gr.Row():
             with gr.Column(scale=3):
                 with gr.Column():
-                    with gr.Accordion('Image Prompt', open=not model_mgr.is_mv_mode, visible=not model_mgr.is_mv_mode) as tab_ip:
-                        image = gr.Image(label='Image', type='pil', image_mode='RGBA', height=290)
+                    # Single-image input (hidden — replaced by SPA)
+                    image = gr.Image(label='Image', type='pil', image_mode='RGBA', height=100, visible=False, value=None)
+                    _unused_ip = gr.Textbox(visible=False, value=None)  # deprecated placeholder
 
-                    with gr.Accordion('Text Prompt', open=False, visible=HAS_T2I and not model_mgr.is_mv_mode) as tab_tp:
+                    with gr.Accordion('Text Prompt (Text-to-3D)', open=False, visible=HAS_T2I) as tab_tp:
                         caption = gr.Textbox(label='Text Prompt',
-                                             placeholder='HunyuanDiT will be used to generate image.',
+                                             placeholder='HunyuanDiT will generate an image from your description.',
                                              info='Example: A 3D model of a cute cat, white background')
                     with gr.Accordion('MultiView Prompt', open=model_mgr.is_mv_mode, visible=model_mgr.is_mv_mode) as tab_mv:
-                        # gr.Label('Please upload at least one front image.')
                         with gr.Row():
                             mv_image_front = gr.Image(label='Front', type='pil', image_mode='RGBA', height=140,
                                                       min_width=100, elem_classes='mv-image')
@@ -462,95 +478,10 @@ def build_app():
                     file_out = gr.File(label="File", visible=False)
                     file_out2 = gr.File(label="File", visible=False)
 
-                with gr.Column():
-                    with gr.Accordion("Model Selection", open=True):
-                        model_family = gr.Dropdown(
-                            label="Shape Model",
-                            choices=ModelManager.get_family_choices(),
-                            value=model_mgr.shape_family,
-                            interactive=True,
-                        )
-                        speed_variant = gr.Dropdown(
-                            label="Speed Variant",
-                            choices=get_available_variants(model_mgr.shape_family),
-                            value=model_mgr.shape_variant,
-                            interactive=True,
-                        )
-                        tex_model = gr.Dropdown(
-                            label="Texture Model",
-                            choices=ModelManager.get_tex_choices(),
-                            value=model_mgr.tex_key,
-                            interactive=True,
-                            visible=HAS_TEXTUREGEN,
-                        )
-                        model_status = gr.Markdown(
-                            value=f"**Loaded:** {model_mgr.current_model_display}  \n**Texture:** {model_mgr.current_tex_display}"
-                        )
-                        with gr.Row():
-                            load_model_btn = gr.Button(value="Apply Model Change", variant="secondary", min_width=100)
-
-                    with gr.Accordion('Advanced Options', open=False):
-                        with gr.Row():
-                            decode_mode = gr.Radio(label='Decoding Mode',
-                                                   info='The resolution for exporting mesh from generated vectset',
-                                                   choices=['Low', 'Standard', 'High'],
-                                                   value='Standard')
-                        with gr.Row():
-                            check_box_rembg = gr.Checkbox(value=True, label='Remove Background', min_width=100)
-                            randomize_seed = gr.Checkbox(label="Randomize seed", value=True, min_width=100)
-                        seed = gr.Slider(
-                            label="Seed",
-                            minimum=0,
-                            maximum=MAX_SEED,
-                            step=1,
-                            value=1234,
-                            min_width=100,
-                        )
-                        with gr.Row():
-                            num_steps = gr.Slider(maximum=100,
-                                                  minimum=1,
-                                                  value=model_mgr.default_steps,
-                                                  step=1, label='Inference Steps')
-                            octree_resolution = gr.Slider(maximum=512, minimum=16, value=256, label='Octree Resolution')
-                        with gr.Row():
-                            cfg_scale = gr.Number(value=5.0, label='Guidance Scale', min_width=100)
-                            num_chunks = gr.Slider(maximum=5000000, minimum=1000, value=8000,
-                                                   label='Number of Chunks', min_width=100)
-                    with gr.Accordion("Export", open=True):
-                        with gr.Row():
-                            file_type = gr.Dropdown(label='File Type', choices=SUPPORTED_FORMATS,
-                                                    value='glb', min_width=100)
-                            reduce_face = gr.Checkbox(label='Simplify Mesh', value=False, min_width=100)
-                            export_texture = gr.Checkbox(label='Include Texture', value=False,
-                                                         visible=False, min_width=100)
-                        target_face_num = gr.Slider(maximum=1000000, minimum=100, value=10000,
-                                                    label='Target Face Number')
-                        with gr.Row():
-                            confirm_export = gr.Button(value="Transform", min_width=100)
-                            file_export = gr.DownloadButton(label="Download", variant='primary',
-                                                            interactive=False, min_width=100)
-
             with gr.Column(scale=6):
                 with gr.Column():
                     with gr.Accordion('Generated Mesh', open=True):
                         html_gen_mesh = gr.HTML(HTML_OUTPUT_PLACEHOLDER, label='Output')
-                    with gr.Accordion('Part Decomposition', open=False):
-                        gr.Markdown("Segment the generated mesh into semantic parts using P3-SAM, then generate completed parts with XPart, and prepare STL files for 3D printing.")
-                        with gr.Row():
-                            segment_btn = gr.Button(value="1. Segment Parts", variant="primary", min_width=100)
-                            generate_parts_btn = gr.Button(value="2. Generate Parts", variant="primary", min_width=100)
-                            prepare_print_btn = gr.Button(value="3. Prepare for Printing", variant="primary", min_width=100)
-                        part_status = gr.Markdown(value="Load a mesh first, then click **Segment**.")
-                        with gr.Row():
-                            part_segmented = gr.Model3D(clear_color=[0.0, 0.0, 0.0, 0.0], label="Segmented Mesh")
-                            part_generated = gr.Model3D(clear_color=[0.0, 0.0, 0.0, 0.0], label="Generated Parts")
-                        with gr.Row():
-                            print_download = gr.File(label="Download STL Files (ZIP)", visible=True, interactive=False)
-                        part_face_id = gr.File(label="Face IDs (.npy)", visible=False)
-                        # Hidden state to carry mesh path from shape gen to part pipeline
-                        part_mesh_state = gr.State(value=None)
-                    with gr.Accordion('Exporting Mesh', open=True):
-                        html_export_mesh = gr.HTML(HTML_OUTPUT_PLACEHOLDER, label='Output')
                     with gr.Accordion('Mesh Statistic', open=False):
                         stats = gr.Json({}, label='Mesh Stats')
 
@@ -596,20 +527,14 @@ def build_app():
                 mv_image_back,
                 mv_image_left,
                 mv_image_right,
-                num_steps,
-                cfg_scale,
-                seed,
-                octree_resolution,
-                check_box_rembg,
-                num_chunks,
-                randomize_seed,
+                default_steps,
+                default_guidance,
+                default_seed,
+                default_octree_res,
+                default_remove_bg,
+                default_num_chunks,
             ],
-            outputs=[file_out, html_gen_mesh, stats, seed]
-        ).then(
-            lambda p: (gr.update(visible=False, value=False), gr.update(interactive=True), gr.update(interactive=True),
-                     gr.update(interactive=False), p),
-            inputs=[file_out],
-            outputs=[export_texture, reduce_face, confirm_export, file_export, part_mesh_state],
+            outputs=[file_out, html_gen_mesh, stats, default_seed]
         )
 
         btn_all.click(
@@ -621,496 +546,14 @@ def build_app():
                 mv_image_back,
                 mv_image_left,
                 mv_image_right,
-                num_steps,
-                cfg_scale,
-                seed,
-                octree_resolution,
-                check_box_rembg,
-                num_chunks,
-                randomize_seed,
+                default_steps,
+                default_guidance,
+                default_seed,
+                default_octree_res,
+                default_remove_bg,
+                default_num_chunks,
             ],
-            outputs=[file_out, file_out2, html_gen_mesh, stats, seed]
-        ).then(
-            lambda p: (gr.update(visible=True, value=True), gr.update(interactive=False), gr.update(interactive=True),
-                     gr.update(interactive=False), p),
-            inputs=[file_out],
-            outputs=[export_texture, reduce_face, confirm_export, file_export, part_mesh_state],
-        )
-
-        # ------------------------------------------------------------------
-        # Model selection event handlers
-        # ------------------------------------------------------------------
-        def on_model_family_change(family_key):
-            """Update speed variant choices when model family changes."""
-            variants = get_available_variants(family_key)
-            return gr.update(choices=variants, value=variants[0])
-
-        model_family.change(
-            on_model_family_change,
-            inputs=[model_family],
-            outputs=[speed_variant],
-        )
-
-        def on_speed_variant_change(family_key, variant_key):
-            """Load the selected shape model and update UI."""
-            info = model_mgr.load_shape_model(family_key, variant_key)
-
-            # Update model status text
-            status_text = f"**Loaded:** {info['model_display']}  \n**Texture:** {model_mgr.current_tex_display}"
-
-            return (
-                gr.update(value=info["default_steps"]),          # num_steps slider
-                gr.update(value=status_text),                    # model_status markdown
-                gr.update(visible=info["is_mv"]),                # tab_mv prompt accordion
-                gr.update(visible=not info["is_mv"]),            # tab_ip prompt accordion
-                gr.update(visible=HAS_T2I and not info["is_mv"]), # tab_tp prompt accordion
-                gr.update(visible=info["is_mv"]),                # tab_mv gallery accordion
-                gr.update(visible=not info["is_mv"]),            # tab_gi gallery accordion
-                gr.update(visible=HAS_T2I and not info["is_mv"]),# tab_gt gallery accordion
-            )
-
-        speed_variant.change(
-            on_speed_variant_change,
-            inputs=[model_family, speed_variant],
-            outputs=[
-                num_steps, model_status,
-                tab_mv, tab_ip, tab_tp,          # prompt accordions
-                tab_mv_gallery, tab_gi, tab_gt,   # gallery accordions
-            ],
-        )
-
-        def on_tex_model_change(tex_key):
-            """Load the selected texture model."""
-            model_mgr.load_tex_model(tex_key)
-            status_text = f"**Loaded:** {model_mgr.current_model_display}  \n**Texture:** {model_mgr.current_tex_display}"
-            return gr.update(value=status_text)
-
-        tex_model.change(
-            on_tex_model_change,
-            inputs=[tex_model],
-            outputs=[model_status],
-        )
-
-        def on_decode_mode_change(value):
-            if value == 'Low':
-                return gr.update(value=196)
-            elif value == 'Standard':
-                return gr.update(value=256)
-            else:
-                return gr.update(value=384)
-
-        decode_mode.change(on_decode_mode_change, inputs=[decode_mode], outputs=[octree_resolution])
-
-        # ------------------------------------------------------------------
-        # Part Decomposition (P3-SAM + XPart) event handlers
-        # ------------------------------------------------------------------
-        _PARTSEG_AVAILABLE = False
-        try:
-            from hy3dgen.partseg import PartSegManager
-            _partseg_mgr = PartSegManager()
-            _PARTSEG_AVAILABLE = True
-        except Exception as e:
-            print(f"Part segmentation unavailable: {e}")
-
-        def on_segment_parts(mesh_path, seed):
-            """Run P3-SAM segmentation on the generated mesh — with live progress."""
-            import gc, time
-            import numpy as np
-            import pickle as _pickle
-            import logging
-            _mem_logger = logging.getLogger("gradio.memory")
-
-            if mesh_path is None:
-                raise gr.Error("Please generate a mesh first (click Gen Shape or Gen Textured Shape).")
-            if not _PARTSEG_AVAILABLE:
-                raise gr.Error("Part segmentation is not available. Check dependencies (spconv, torch_scatter, etc.).")
-
-            # ---- Phase 1: GPU Cleanup (yield status) ----
-            gpu_total = torch.cuda.get_device_properties(0).total_memory / 1e6 if torch.cuda.is_available() else 0
-            gpu_name = torch.cuda.get_device_name(0) if torch.cuda.is_available() else "CPU"
-            yield None, None, None, (
-                f"**🧹 Phase 1/5: Freeing GPU memory**\n\n"
-                f"**Device:** {gpu_name} ({gpu_total:.0f} MB)\n"
-                f"Moving shape model to CPU..."
-            )
-
-            # Fully unload shape + texture models (not just .to('cpu')).
-            # Keeping the shape model resident corrupts the CUDA context and makes
-            # XPart's custom kernels fail with 'CUDA error: unknown error'. Full
-            # unload also frees CPU RAM. Shape reloads on demand via ensure_shape_loaded().
-            model_mgr.unload_shape_model()
-            if hasattr(model_mgr, 'unload_tex_model'):
-                try: model_mgr.unload_tex_model()
-                except Exception: pass
-
-            for _ in range(3):
-                gc.collect()
-                torch.cuda.empty_cache()
-            if torch.cuda.is_available():
-                torch.cuda.synchronize()
-
-            free_mb = torch.cuda.mem_get_info()[0] / 1e6 if torch.cuda.is_available() else -1
-            yield None, None, None, (
-                f"**🧹 Phase 1/5: GPU Cleanup — done**\n\n"
-                f"**Free VRAM:** {free_mb:.0f} / {gpu_total:.0f} MB\n"
-                f"Loading mesh..."
-            )
-
-            # ---- Phase 2: Load Mesh ----
-            mesh = trimesh.load(mesh_path, force='mesh', process=False)
-            nv, nf = len(mesh.vertices), len(mesh.faces)
-            est_time = "2-4 min" if nf < 50000 else "4-6 min"
-
-            yield None, None, None, (
-                f"**📂 Phase 2/5: Mesh Loaded**\n\n"
-                f"**Vertices:** {nv:,}  |  **Faces:** {nf:,}\n"
-                f"**Estimated time:** {est_time} (GPU inference)\n\n"
-                f"**🚀 Phase 3/5: P3-SAM Segmentation (GPU)...**\n"
-                f"• Sampling 100K surface points\n"
-                f"• Extracting Sonata 3D features\n"
-                f"• 400 prompt points × FPS sampling\n"
-                f"• ~50 batches of GPU inference\n"
-                f"• NMS clustering + label fixing\n"
-                f"⏳ Running — please wait..."
-            )
-
-            # ---- Phase 3: Run P3-SAM ----
-            t0 = time.time()
-            try:
-                aabb, face_ids = _partseg_mgr.segment(mesh, seed=seed)
-            except Exception as seg_exc:
-                gc.collect(); torch.cuda.empty_cache()
-                raise gr.Error(f"Segmentation failed (likely out of GPU memory): {seg_exc}")
-
-            elapsed = time.time() - t0
-            unique_ids = np.unique(face_ids)
-            n_parts = len(unique_ids) - (1 if -1 in unique_ids else 0)
-
-            free_mb = torch.cuda.mem_get_info()[0] / 1e6 if torch.cuda.is_available() else -1
-            yield None, None, None, (
-                f"**✅ Phase 3/5: Segmentation Complete**\n\n"
-                f"**Parts found:** {n_parts}\n"
-                f"**Time:** {elapsed:.0f}s (~{elapsed/60:.1f} min)\n"
-                f"**Free VRAM:** {free_mb:.0f} / {gpu_total:.0f} MB\n\n"
-                f"**🎨 Phase 4/5: Unloading P3-SAM from GPU, coloring mesh...**"
-            )
-
-            # ---- Phase 4: Unload P3-SAM + Color ----
-            try:
-                _partseg_mgr.unload_automask()
-            except Exception as unload_exc:
-                _mem_logger.warning("Failed to unload P3-SAM: %s", unload_exc)
-
-            # NOTE: do NOT restore the shape model to GPU here. The user's next
-            # step is 'Generate Parts' (XPart); a resident shape model corrupts
-            # the CUDA context. The shape model reloads lazily on the next shape
-            # generation via model_mgr.ensure_shape_loaded().
-            gc.collect(); torch.cuda.empty_cache()
-
-            # Color mesh by part ID
-            color_map = {}
-            for i in unique_ids:
-                if i == -1: continue
-                color_map[i] = np.random.RandomState(int(i)).randint(0, 255, 3)
-            face_colors = np.array(
-                [color_map.get(i, [0, 0, 0]) for i in face_ids]
-            ).astype(np.uint8)
-            mesh_save = mesh.copy()
-            mesh_save.visual.face_colors = face_colors
-
-            yield None, None, None, (
-                f"**🎨 Phase 4/5: Mesh Colored**\n\n"
-                f"**{n_parts} parts** found & colored\n"
-                f"**💾 Phase 5/5: Saving results...**"
-            )
-
-            # ---- Phase 5: Save ----
-            save_folder = gen_save_folder()
-            segmented_path = os.path.join(save_folder, 'segmented.glb')
-            mesh_save.export(segmented_path)
-            face_id_path = os.path.join(save_folder, 'face_ids.npy')
-            np.save(face_id_path, face_ids)
-
-            aabb_pkl_path = os.path.join(save_folder, 'aabb.pkl')
-            with open(aabb_pkl_path, 'wb') as f:
-                _pickle.dump({'aabb': aabb, 'mesh_path': mesh_path}, f)
-
-            part_state = {'aabb_pkl': aabb_pkl_path, 'mesh_path': mesh_path}
-            del mesh, mesh_save, face_colors
-            gc.collect()
-
-            yield segmented_path, face_id_path, part_state, (
-                f"**✅ Done!** Found **{n_parts} parts** in {elapsed:.0f}s.\n\n"
-                f"Click **'2. Generate Parts'** to create printable part meshes."
-            )
-
-        def on_generate_parts(part_state, seed):
-            """Run XPart to generate completed parts — with live progress."""
-            import pickle as _pickle, gc, time, logging
-            _mem_logger = logging.getLogger("gradio.memory")
-
-            if part_state is None or not isinstance(part_state, dict) or 'aabb_pkl' not in part_state:
-                raise gr.Error("Please run 'Segment Parts' first.")
-            if not os.path.exists(part_state['aabb_pkl']):
-                raise gr.Error("Segmentation data no longer available. Please run 'Segment Parts' again.")
-
-            with open(part_state['aabb_pkl'], 'rb') as f:
-                saved = _pickle.load(f)
-            aabb = saved['aabb']
-            mesh_path = saved['mesh_path']
-
-            gpu_total = torch.cuda.get_device_properties(0).total_memory / 1e6 if torch.cuda.is_available() else 0
-            n_parts = len(aabb) if aabb is not None else 0
-
-            # ---- Phase 1: GPU Cleanup ----
-            yield None, None, part_state, (
-                f"**🧹 Phase 1/4: Freeing GPU memory**\n\n"
-                f"Moving models to CPU...\n"
-                f"Parts to generate: **{n_parts}**"
-            )
-
-            # Fully unload shape + texture models before XPart (a resident shape
-            # model corrupts the CUDA context -> XPart fps 'CUDA error: unknown error').
-            model_mgr.unload_shape_model()
-            if hasattr(model_mgr, 'unload_tex_model'):
-                try: model_mgr.unload_tex_model()
-                except Exception: pass
-            try: _partseg_mgr.unload_automask()
-            except Exception: pass
-
-            gc.collect(); torch.cuda.empty_cache()
-            gc.collect(); torch.cuda.empty_cache()
-            if torch.cuda.is_available():
-                torch.cuda.synchronize()
-
-            free_mb = torch.cuda.mem_get_info()[0] / 1e6 if torch.cuda.is_available() else -1
-            est_min = max(1, n_parts * 0.5)
-            yield None, None, part_state, (
-                f"**🧹 Phase 1/4: GPU Cleanup — done**\n\n"
-                f"**Free VRAM:** {free_mb:.0f} / {gpu_total:.0f} MB\n"
-                f"**Parts:** {n_parts}\n\n"
-                f"**🚀 Phase 2/4: Loading XPart model (GPU)...**\n"
-                f"Downloading from HuggingFace if needed..."
-            )
-
-            # ---- Phase 2: Load XPart + Run ----
-            t0 = time.time()
-            yield None, None, part_state, (
-                f"**🚀 Phase 2/4: XPart Generation (GPU)...**\n\n"
-                f"**Parts:** {n_parts}\n"
-                f"**Estimated time:** {est_min:.0f}-{est_min*1.5:.0f} min\n"
-                f"• Per-part latent diffusion (50 steps each)\n"
-                f"• Marching cubes surface extraction\n"
-                f"⏳ Running — please wait..."
-            )
-
-            try:
-                obj_mesh, bbox_mesh, explode_mesh = _partseg_mgr.generate_parts(
-                    mesh_path, aabb, seed=seed
-                )
-            except Exception as xp_exc:
-                gc.collect(); torch.cuda.empty_cache()
-                raise gr.Error(f"Part generation failed (likely out of GPU memory): {xp_exc}")
-
-            elapsed = time.time() - t0
-            free_mb = torch.cuda.mem_get_info()[0] / 1e6 if torch.cuda.is_available() else -1
-            yield None, None, part_state, (
-                f"**✅ Phase 2/4: Generation Complete**\n\n"
-                f"**Time:** {elapsed:.0f}s (~{elapsed/60:.1f} min)\n"
-                f"**Free VRAM:** {free_mb:.0f} / {gpu_total:.0f} MB\n\n"
-                f"**🧹 Phase 3/4: Unloading XPart from GPU...**"
-            )
-
-            # ---- Phase 3: Unload XPart ----
-            try:
-                _partseg_mgr.unload_pipeline()
-            except Exception as unload_exc:
-                _mem_logger.warning("Failed to unload XPart: %s", unload_exc)
-
-            # Shape model stays unloaded; it reloads lazily on the next shape
-            # generation (model_mgr.ensure_shape_loaded()).
-            gc.collect(); torch.cuda.empty_cache()
-
-            # ---- Phase 4: Save ----
-            save_folder = gen_save_folder()
-            parts_path = os.path.join(save_folder, 'parts.glb')
-            explode_path = os.path.join(save_folder, 'exploded.glb')
-            obj_mesh.export(parts_path)
-            explode_mesh.export(explode_path)
-
-            # Store parts path in state for downstream slicer
-            part_state['parts_path'] = parts_path
-            part_state['explode_path'] = explode_path
-
-            free_mb = torch.cuda.mem_get_info()[0] / 1e6 if torch.cuda.is_available() else -1
-            yield parts_path, explode_path, part_state, (
-                f"**✅ Done!** Parts generated in {elapsed:.0f}s.\n\n"
-                f"**Free VRAM:** {free_mb:.0f} / {gpu_total:.0f} MB\n\n"
-                f"The exploded view shows all parts separated.\n\n"
-                f"Click **'3. Prepare for Printing'** to generate STL files."
-            )
-
-        segment_btn.click(
-            on_segment_parts,
-            inputs=[part_mesh_state, seed],
-            outputs=[part_segmented, part_face_id, part_mesh_state, part_status],
-        )
-        generate_parts_btn.click(
-            on_generate_parts,
-            inputs=[part_mesh_state, seed],
-            outputs=[part_generated, part_segmented, part_mesh_state, part_status],
-        )
-
-        def on_prepare_print(part_state, seed):
-            """Run slicer on generated parts — with live progress."""
-            import gc, time, zipfile, logging
-            _mem_logger = logging.getLogger("gradio.memory")
-
-            if part_state is None or not isinstance(part_state, dict) or 'parts_path' not in part_state:
-                raise gr.Error("Please run 'Segment Parts' and 'Generate Parts' first.")
-            parts_path = part_state['parts_path']
-            if not os.path.exists(parts_path):
-                raise gr.Error("Parts mesh no longer available. Please run 'Generate Parts' again.")
-
-            gpu_total = torch.cuda.get_device_properties(0).total_memory / 1e6 if torch.cuda.is_available() else 0
-
-            # ---- Phase 1: Load parts ----
-            yield None, None, (
-                f"**📂 Phase 1/4: Loading parts mesh...**\n\n"
-                f"Loading: `{os.path.basename(parts_path)}`"
-            )
-
-            parts_mesh = trimesh.load(parts_path, force='mesh')
-
-            # Handle both Trimesh and Scene
-            if isinstance(parts_mesh, trimesh.Trimesh):
-                scene = trimesh.Scene()
-                scene.add_geometry(parts_mesh, geom_name='generated_parts')
-            elif isinstance(parts_mesh, trimesh.Scene):
-                scene = parts_mesh
-            else:
-                raise gr.Error(f"Unexpected mesh type: {type(parts_mesh)}")
-
-            n_geoms = len(scene.geometry)
-            yield None, None, (
-                f"**📂 Phase 1/4: Parts loaded**\n\n"
-                f"**Geometries:** {n_geoms}\n\n"
-                f"**🔧 Phase 2/4: Running slicer...**\n"
-                f"• Checking bed fit\n"
-                f"• Generating pin/hole connectors\n"
-                f"• Exporting STL files\n"
-                f"⏳ Please wait..."
-            )
-
-            # ---- Phase 2: Run slicer ----
-            t0 = time.time()
-            try:
-                from hy3dgen.slicer import SlicerManager
-                from hy3dgen.slicer.config import load_profile
-
-                slicer = SlicerManager()
-                save_folder = gen_save_folder()
-                stl_dir = os.path.join(save_folder, 'stl')
-                os.makedirs(stl_dir, exist_ok=True)
-
-                result = slicer.process(
-                    scene,
-                    output_dir=stl_dir,
-                    skip_connectors=False,
-                )
-            except Exception as sl_exc:
-                gc.collect()
-                raise gr.Error(f"Slicer failed: {sl_exc}")
-
-            elapsed = time.time() - t0
-            n_parts = len(result)
-            fitted = sum(1 for p in result if p.fits_bed)
-            oversized = n_parts - fitted
-
-            yield None, None, (
-                f"**✅ Phase 2/4: Slicing complete**\n\n"
-                f"**Parts:** {n_parts}  |  "
-                f"**Fit bed:** {fitted}/{n_parts}  |  "
-                f"**Time:** {elapsed:.0f}s\n"
-                f"{'⚠ ' + str(oversized) + ' part(s) exceed bed size' if oversized else '✅ All parts fit the bed'}\n\n"
-                f"**📦 Phase 3/4: Creating ZIP archive...**"
-            )
-
-            # ---- Phase 3: Create ZIP ----
-            zip_path = os.path.join(save_folder, 'print_parts.zip')
-            stl_count = 0
-            with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zf:
-                for fname in sorted(os.listdir(stl_dir)):
-                    if fname.endswith('.stl') or fname.endswith('.txt'):
-                        zf.write(os.path.join(stl_dir, fname), fname)
-                        if fname.endswith('.stl'):
-                            stl_count += 1
-
-            zip_size_mb = os.path.getsize(zip_path) / (1024 * 1024)
-
-            yield zip_path, gr.update(), (
-                f"**📦 Phase 3/4: Archive ready**\n\n"
-                f"**STL files:** {stl_count}  |  "
-                f"**ZIP size:** {zip_size_mb:.1f} MB\n\n"
-                f"**💾 Phase 4/4: Done!**"
-            )
-
-            # ---- Phase 4: Done ----
-            del parts_mesh, scene
-            gc.collect()
-
-            yield gr.update(value=zip_path), gr.update(), (
-                f"**✅ Done!** Print parts ready.\n\n"
-                f"**STL files:** {stl_count}  |  "
-                f"**Fit bed:** {fitted}/{n_parts}  |  "
-                f"**Time:** {elapsed:.0f}s\n\n"
-                f"⬇️ **Download the ZIP file** below and extract to get individual STL files.\n"
-                f"📋 A README.txt with assembly notes is included in the archive."
-            )
-
-        prepare_print_btn.click(
-            on_prepare_print,
-            inputs=[part_mesh_state, seed],
-            outputs=[print_download, part_generated, part_status],
-        )
-
-        def on_export_click(file_out, file_out2, file_type, reduce_face, export_texture, target_face_num):
-            if file_out is None:
-                raise gr.Error('Please generate a mesh first.')
-
-            print(f'exporting {file_out}')
-            print(f'reduce face to {target_face_num}')
-            if export_texture:
-                mesh = trimesh.load(file_out2)
-                save_folder = gen_save_folder()
-                path = export_mesh(mesh, save_folder, textured=True, type=file_type)
-
-                # for preview
-                save_folder = gen_save_folder()
-                _ = export_mesh(mesh, save_folder, textured=True)
-                model_viewer_html = build_model_viewer_html(save_folder, height=HTML_HEIGHT, width=HTML_WIDTH,
-                                                            textured=True)
-            else:
-                mesh = trimesh.load(file_out)
-                mesh = model_mgr.floater_remover(mesh)
-                mesh = model_mgr.degenerate_face_remover(mesh)
-                if reduce_face:
-                    mesh = model_mgr.face_reducer(mesh, target_face_num)
-                save_folder = gen_save_folder()
-                path = export_mesh(mesh, save_folder, textured=False, type=file_type)
-
-                # for preview
-                save_folder = gen_save_folder()
-                _ = export_mesh(mesh, save_folder, textured=False)
-                model_viewer_html = build_model_viewer_html(save_folder, height=HTML_HEIGHT, width=HTML_WIDTH,
-                                                            textured=False)
-            print(f'export to {path}')
-            return model_viewer_html, gr.update(value=path, interactive=True)
-
-        confirm_export.click(
-            on_export_click,
-            inputs=[file_out, file_out2, file_type, reduce_face, export_texture, target_face_num],
-            outputs=[html_export_mesh, file_export]
+            outputs=[file_out, file_out2, html_gen_mesh, stats, default_seed]
         )
 
     return demo
@@ -1173,55 +616,41 @@ if __name__ == '__main__':
     example_ts = get_example_txt_list()
     example_mvs = get_example_mv_list()
 
-    SUPPORTED_FORMATS = ['glb', 'obj', 'ply', 'stl']
-
-    from hy3dgen.shapegen import FaceReducer, FloaterRemover, DegenerateFaceRemover, MeshSimplifier
-    from hy3dgen.shapegen.pipelines import export_to_trimesh
-    from hy3dgen.rembg import BackgroundRemover
-
-    # Load shape model via ModelManager
+    # ========= Model Manager: Init & Load Shape Model ==========
+    # Load the shape model via ModelManager (handles download, compile, flashvdm)
     model_mgr.load_shape_model(model_mgr.shape_family, model_mgr.shape_variant)
-    if args.compile:
-        model_mgr.shape_pipeline.compile()
-
-    # Init post-process workers (stateless, no GPU VRAM concern)
+    
+    HAS_T2I = args.enable_t23d
+    HAS_TEXTUREGEN = not args.disable_tex
+    
+    # ========= Post-processors & RemBG ==========
+    # These are created once and used by generation_all / shape_generation
     model_mgr.floater_remover = FloaterRemover()
     model_mgr.degenerate_face_remover = DegenerateFaceRemover()
     model_mgr.face_reducer = FaceReducer()
+    
+    # Background Remover (wraps rembg — lazy download)
     model_mgr.rmbg_worker = BackgroundRemover()
-
-    # Texture generation (optional)
-    HAS_TEXTUREGEN = False
-    if not args.disable_tex:
+    
+    # ========= Load Texture Model ==========
+    if HAS_TEXTUREGEN:
         try:
             model_mgr.load_tex_model(model_mgr.tex_key)
-            HAS_TEXTUREGEN = model_mgr.has_texgen
+            print(f"Texture model loaded: {model_mgr.current_tex_display}")
         except Exception as e:
-            print(e)
-            print("Failed to load texture generator.")
-            print('Please try to install requirements by following README.md')
+            print(f"Texture generation unavailable: {e}")
             HAS_TEXTUREGEN = False
-
-    # Text-to-image (optional)
-    HAS_T2I = True
+    
+    # ========= Text to Image (HunyuanDiT) ==========
     if args.enable_t23d:
-        from hy3dgen.text2image import HunyuanDiTPipeline
-        model_mgr.t2i_worker = HunyuanDiTPipeline(
-            'Tencent-Hunyuan/HunyuanDiT-v1.1-Diffusers-Distilled', device=args.device
-        )
-        HAS_T2I = True
+        try:
+            model_mgr.t2i_worker = HunyuanDiTPipeline(
+                'Tencent-Hunyuan/HunyuanDiT-v1.1-Diffusers-Distilled', device=args.device)
+            print("Text-to-image worker loaded")
+        except Exception as e:
+            print(f"Text-to-image loading failed: {e}")
+            print("Hint: install diffusers and try again")
+            print("hint: pip install git+https://github.com/huggingface/diffusers")
 
-    # https://discuss.huggingface.co/t/how-to-serve-an-html-file/33921/2
-    # create a FastAPI app
-    app = FastAPI()
-    # create a static directory to store the static files
-    static_dir = Path(SAVE_DIR).absolute()
-    static_dir.mkdir(parents=True, exist_ok=True)
-    app.mount("/static", StaticFiles(directory=static_dir, html=True), name="static")
-    shutil.copytree('./assets/env_maps', os.path.join(static_dir, 'env_maps'), dirs_exist_ok=True)
-
-    if model_mgr.low_vram_mode:
-        torch.cuda.empty_cache()
     demo = build_app()
-    app = gr.mount_gradio_app(app, demo, path="/")
-    uvicorn.run(app, host=args.host, port=args.port, workers=1)
+    demo.queue(max_size=20).launch(server_name=args.host, server_port=args.port, share=False)
